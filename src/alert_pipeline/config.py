@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     webhook_url: str = ""
     webhook_headers_json: str = "{}"
 
+    # UI read cache (seconds). Reads hit memory; BG thread reloads from Postgres.
+    ui_cache_ttl_seconds: float = Field(default=2.0, ge=0.2)
+    ui_cache_max_alerts: int = Field(default=2000, ge=100)
+
     log_level: str = "INFO"
 
 
