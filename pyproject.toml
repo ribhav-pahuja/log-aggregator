@@ -28,6 +28,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "ruff>=0.3.0",
+    "fakeredis>=2.21.0",
 ]
 flink = [
     "apache-flink==1.19.1",
