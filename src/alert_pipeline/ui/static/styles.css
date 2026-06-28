@@ -306,3 +306,6 @@ body {
   border-color: #f31260 !important;
   color: #ffb4c4 !important;
 }
+
+.pager { display:flex; align-items:center; gap:0.4rem; }
+.pager .btn { padding:0.2rem 0.5rem; font-size:0.75rem; }

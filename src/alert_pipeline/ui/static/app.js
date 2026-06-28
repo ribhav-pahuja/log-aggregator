@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { alerts: [], selectedId: null, timer: null, busy: false };
+  const state = { alerts: [], selectedId: null, timer: null, busy: false, page: 1, pageSize: 50, total: 0, pages: 0 };
 
   function qs() {
     const params = new URLSearchParams();
@@ -12,7 +12,8 @@
     if (severity) params.set("severity", severity);
     if (service) params.set("service", service);
     if (q) params.set("q", q);
-    params.set("limit", "150");
+    params.set("page", String(state.page || 1));
+    params.set("page_size", String(state.pageSize || 50));
     return params.toString();
   }
 
@@ -221,13 +222,14 @@
     try {
       const [a, dispatches] = await Promise.all([
         fetchJSON(`/api/alerts/${id}`),
-        fetchJSON(`/api/alerts/${id}/dispatches`),
+        fetchJSON(`/api/alerts/${id}/dispatches?page=1&page_size=50`),
       ]);
       const labels = Object.entries(a.labels || {})
         .map(([k, v]) => `<span class="pill">${escapeHtml(k)}=${escapeHtml(v)}</span>`)
         .join(" ") || "—";
-      const rows = dispatches.length
-        ? dispatches
+      const dispItems = Array.isArray(dispatches) ? dispatches : (dispatches.items || []);
+      const rows = dispItems.length
+        ? dispItems
             .map(
               (d) => `<tr>
               <td>${escapeHtml(d.channel)}</td>
@@ -287,7 +289,23 @@
   }
 
   async function loadAlerts() {
-    state.alerts = await fetchJSON(`/api/alerts?${qs()}`);
+    const data = await fetchJSON(`/api/alerts?${qs()}`);
+    // Paginated envelope; tolerate legacy array for one release
+    if (Array.isArray(data)) {
+      state.alerts = data;
+      state.total = data.length;
+      state.pages = 1;
+    } else {
+      state.alerts = data.items || [];
+      state.total = data.total || 0;
+      state.page = data.page || 1;
+      state.pageSize = data.page_size || state.pageSize;
+      state.pages = data.pages || 0;
+    }
+    const lc = $("listCount");
+    if (lc) lc.textContent = `${state.alerts.length} / ${state.total}`;
+    const pg = $("pageInfo");
+    if (pg) pg.textContent = `Page ${state.page}${state.pages ? ` / ${state.pages}` : ""}`;
     renderList();
   }
 
@@ -438,6 +456,15 @@
     }
     await refresh();
   };
+  const prev = $("btnPrevPage");
+  const next = $("btnNextPage");
+  if (prev) prev.addEventListener("click", () => {
+    if (state.page > 1) { state.page -= 1; refresh({ keepSelection: true }); }
+  });
+  if (next) next.addEventListener("click", () => {
+    if (!state.pages || state.page < state.pages) { state.page += 1; refresh({ keepSelection: true }); }
+  });
+
   boot();
   schedule();
 })();

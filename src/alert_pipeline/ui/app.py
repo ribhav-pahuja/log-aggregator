@@ -1,4 +1,4 @@
-"""FastAPI dashboard: reads from an in-memory TTL cache; writes go to Postgres."""
+"""FastAPI dashboard: reads from shared Redis TTL cache; writes go to Postgres."""
 
 from __future__ import annotations
 
@@ -107,6 +107,47 @@ class DemoFireOut(BaseModel):
     note: str = ""
 
 
+class PageMeta(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    has_next: bool
+    has_prev: bool
+
+
+class AlertPageOut(BaseModel):
+    items: list[AlertOut]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    has_next: bool
+    has_prev: bool
+
+
+class DispatchPageOut(BaseModel):
+    items: list[DispatchOut]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    has_next: bool
+    has_prev: bool
+
+
+def _page_meta(page, page_size, total) -> PageMeta:
+    pages = max(1, (total + page_size - 1) // page_size) if total else 0
+    return PageMeta(
+        page=page,
+        page_size=page_size,
+        total=total,
+        pages=pages,
+        has_next=page * page_size < total,
+        has_prev=page > 1,
+    )
+
+
 def _alert_out(c: CachedAlert) -> AlertOut:
     return AlertOut.model_validate(c.as_dict())
 
@@ -129,9 +170,11 @@ def create_app() -> FastAPI:
     session_factory: sessionmaker[Session] = repo._session_factory  # noqa: SLF001
     cache = AlertReadCache(
         session_factory,
+        redis_url=settings.redis_url,
         ttl_seconds=settings.ui_cache_ttl_seconds,
+        lock_ttl_seconds=settings.ui_cache_lock_ttl_seconds,
         max_alerts=settings.ui_cache_max_alerts,
-        background_refresh=True,
+        key_prefix=settings.ui_cache_key_prefix,
     )
 
     @asynccontextmanager
@@ -139,8 +182,9 @@ def create_app() -> FastAPI:
         Base.metadata.create_all(repo._engine)  # noqa: SLF001
         cache.start()
         logger.info(
-            "UI cache started ttl=%ss (reads from memory, refresh from Postgres)",
+            "UI Redis cache started ttl=%ss url=%s",
             settings.ui_cache_ttl_seconds,
+            settings.redis_url,
         )
         yield
         cache.stop()
@@ -194,24 +238,40 @@ def create_app() -> FastAPI:
             last_alert_at=s.last_alert_at,
         )
 
-    @app.get("/api/alerts", response_model=list[AlertOut])
+    @app.get("/api/alerts", response_model=AlertPageOut)
     def list_alerts(
         status: str | None = Query(None),
         severity: str | None = Query(None),
         service: str | None = Query(None),
         q: str | None = Query(None),
-        limit: int = Query(100, ge=1, le=500),
-        offset: int = Query(0, ge=0),
-    ) -> list[AlertOut]:
-        rows = cache.list_alerts(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        # legacy aliases
+        limit: int | None = Query(None, ge=1, le=200),
+        offset: int | None = Query(None, ge=0),
+    ) -> AlertPageOut:
+        if limit is not None:
+            page_size = limit
+            if offset is not None:
+                page = (offset // page_size) + 1
+        pg = cache.list_alerts_page(
             status=status,
             severity=severity,
             service=service,
             q=q,
-            limit=limit,
-            offset=offset,
+            page=page,
+            page_size=page_size,
         )
-        return [_alert_out(a) for a in rows]
+        meta = _page_meta(pg.page, pg.page_size, pg.total)
+        return AlertPageOut(
+            items=[_alert_out(a) for a in pg.items],
+            page=meta.page,
+            page_size=meta.page_size,
+            total=meta.total,
+            pages=meta.pages,
+            has_next=meta.has_next,
+            has_prev=meta.has_prev,
+        )
 
     @app.get("/api/alerts/{alert_id}", response_model=AlertOut)
     def get_alert(alert_id: str) -> AlertOut:
@@ -220,9 +280,26 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Alert not found")
         return _alert_out(row)
 
-    @app.get("/api/alerts/{alert_id}/dispatches", response_model=list[DispatchOut])
-    def alert_dispatches(alert_id: str, limit: int = Query(50, ge=1, le=200)) -> list[DispatchOut]:
-        return [_dispatch_out(d) for d in cache.alert_dispatches(alert_id, limit=limit)]
+    @app.get("/api/alerts/{alert_id}/dispatches", response_model=DispatchPageOut)
+    def alert_dispatches(
+        alert_id: str,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        limit: int | None = Query(None, ge=1, le=200),
+    ) -> DispatchPageOut:
+        if limit is not None:
+            page_size = limit
+        pg = cache.alert_dispatches_page(alert_id, page=page, page_size=page_size)
+        meta = _page_meta(pg.page, pg.page_size, pg.total)
+        return DispatchPageOut(
+            items=[_dispatch_out(d) for d in pg.items],
+            page=meta.page,
+            page_size=meta.page_size,
+            total=meta.total,
+            pages=meta.pages,
+            has_next=meta.has_next,
+            has_prev=meta.has_prev,
+        )
 
     def _apply_status(alert_id: str, status: AlertStatusLiteral) -> AlertOut:
         with session_factory() as session:
@@ -258,9 +335,25 @@ def create_app() -> FastAPI:
     def services() -> list[str]:
         return cache.list_services()
 
-    @app.get("/api/dispatches/recent", response_model=list[DispatchOut])
-    def recent_dispatches(limit: int = Query(30, ge=1, le=100)) -> list[DispatchOut]:
-        return [_dispatch_out(d) for d in cache.recent_dispatches(limit=limit)]
+    @app.get("/api/dispatches/recent", response_model=DispatchPageOut)
+    def recent_dispatches(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(30, ge=1, le=200),
+        limit: int | None = Query(None, ge=1, le=200),
+    ) -> DispatchPageOut:
+        if limit is not None:
+            page_size = limit
+        pg = cache.recent_dispatches_page(page=page, page_size=page_size)
+        meta = _page_meta(pg.page, pg.page_size, pg.total)
+        return DispatchPageOut(
+            items=[_dispatch_out(d) for d in pg.items],
+            page=meta.page,
+            page_size=meta.page_size,
+            total=meta.total,
+            pages=meta.pages,
+            has_next=meta.has_next,
+            has_prev=meta.has_prev,
+        )
 
     @app.post("/api/demo/reset", response_model=DemoResetOut)
     def demo_reset() -> DemoResetOut:

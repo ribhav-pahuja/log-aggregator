@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Alert Pipeline</title>
-  <link rel="stylesheet" href="/static/styles.css?v=5" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
 </head>
 <body>
   <div class="app">
@@ -100,7 +100,12 @@
       <section class="panel list-panel">
         <div class="panel-head">
           <h2>Incidents</h2>
-          <span id="listCount" class="muted">0</span>
+          <div class="pager">
+            <button type="button" class="btn" id="btnPrevPage">Prev</button>
+            <span id="pageInfo" class="muted">Page 1</span>
+            <button type="button" class="btn" id="btnNextPage">Next</button>
+            <span id="listCount" class="muted">0</span>
+          </div>
         </div>
         <div id="alertList" class="alert-list"></div>
         <div id="emptyState" class="empty">No alerts yet — use <strong>Fire alert</strong> above to create one.</div>
@@ -114,6 +119,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

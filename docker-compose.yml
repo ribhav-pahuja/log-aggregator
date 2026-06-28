@@ -81,6 +81,20 @@ services:
       - alert-net
 
   # Mock HTTP sink — enable DISPATCH_WEBHOOK_ENABLED on the app to inspect payloads
+
+  redis:
+    image: redis:7-alpine
+    container_name: alert-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - alert-net
+
   webhook-debug:
     image: mendhak/http-https-echo:31
     container_name: alert-webhook-debug
@@ -175,6 +189,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - path: .env
         required: false
@@ -183,6 +199,8 @@ services:
     environment:
       ALERT_CONFIG_PATH: /config/alerts.yaml
       DATABASE_URL: postgresql+psycopg://alerts:alerts@postgres:5432/alerts
+      REDIS_URL: redis://redis:6379/0
+      UI_CACHE_TTL_SECONDS: "10"
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_INPUT_TOPIC: logs
       UI_PORT: "8000"

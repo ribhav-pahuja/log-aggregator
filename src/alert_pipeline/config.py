@@ -16,10 +16,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Stream engine: quix (default) | flink
     pipeline_runtime: Literal["quix", "flink", "quixstreams", "pyflink"] = "quix"
 
-    # Kafka
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_input_topic: str = "logs"
     kafka_consumer_group: str = "alert-pipeline"
@@ -48,9 +46,12 @@ class Settings(BaseSettings):
     webhook_url: str = ""
     webhook_headers_json: str = "{}"
 
-    # UI read cache (seconds). Reads hit memory; BG thread reloads from Postgres.
-    ui_cache_ttl_seconds: float = Field(default=2.0, ge=0.2)
+    # Shared UI read cache (Redis) — multi-instance consistent views
+    redis_url: str = "redis://localhost:6379/0"
+    ui_cache_ttl_seconds: float = Field(default=10.0, ge=1.0)
+    ui_cache_lock_ttl_seconds: float = Field(default=5.0, ge=1.0)
     ui_cache_max_alerts: int = Field(default=2000, ge=100)
+    ui_cache_key_prefix: str = "alert_ui"
 
     log_level: str = "INFO"
 
