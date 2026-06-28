@@ -387,10 +387,24 @@ class AlertReadCache:
         expiry_factor = delta - self.early_expire_beta * ttl * (-1.0 * _safe_log_random())
         return expiry_factor < 0
 
+    def _redis_error(self, op: str, exc: BaseException) -> None:
+        """On Redis failures, degrade to in-process cache so the UI never 500s."""
+        logger.warning(
+            "Redis %s failed (%s); degrading to in-process cache for this process",
+            op,
+            exc,
+        )
+        self._redis = None
+        self._backend = "memory"
+
     def _read_redis_snapshot(self) -> _Snapshot | None:
         if not self._redis:
             return None
-        raw = self._redis.get(self._snapshot_key)
+        try:
+            raw = self._redis.get(self._snapshot_key)
+        except Exception as exc:  # noqa: BLE001
+            self._redis_error("GET snapshot", exc)
+            return None
         if not raw:
             return None
         try:
@@ -405,38 +419,48 @@ class AlertReadCache:
         # Hard TTL slightly above logical TTL so readers can still use soft-stale during lock
         hard_ttl = int(self.ttl_seconds) + int(self.lock_ttl_seconds) + 2
         payload = json.dumps(snap.to_jsonable(), separators=(",", ":"))
-        self._redis.set(self._snapshot_key, payload, ex=hard_ttl)
+        try:
+            self._redis.set(self._snapshot_key, payload, ex=hard_ttl)
+        except Exception as exc:  # noqa: BLE001
+            self._redis_error("SET snapshot", exc)
 
     def _acquire_lock(self) -> bool:
         if not self._redis:
             return True
-        return bool(
-            self._redis.set(
-                self._lock_key,
-                self._token,
-                nx=True,
-                ex=int(self.lock_ttl_seconds),
+        try:
+            return bool(
+                self._redis.set(
+                    self._lock_key,
+                    self._token,
+                    nx=True,
+                    ex=int(self.lock_ttl_seconds),
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001
+            self._redis_error("SET lock", exc)
+            return True  # proceed as sole loader in memory mode
 
     def _release_lock(self) -> None:
         if not self._redis:
             return
         # Release only if we own the lock (simple token compare)
-        pipe = self._redis.pipeline(True)
-        while True:
-            try:
-                pipe.watch(self._lock_key)
-                current = pipe.get(self._lock_key)
-                if current == self._token:
-                    pipe.multi()
-                    pipe.delete(self._lock_key)
-                    pipe.execute()
-                else:
-                    pipe.unwatch()
-                return
-            except Exception:  # noqa: BLE001 — redis WatchError etc.
-                continue
+        try:
+            pipe = self._redis.pipeline(True)
+            while True:
+                try:
+                    pipe.watch(self._lock_key)
+                    current = pipe.get(self._lock_key)
+                    if current == self._token:
+                        pipe.multi()
+                        pipe.delete(self._lock_key)
+                        pipe.execute()
+                    else:
+                        pipe.unwatch()
+                    return
+                except Exception:  # noqa: BLE001 — redis WatchError etc.
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            self._redis_error("release lock", exc)
 
     def _load_from_db(self, *, reason: str = "unspecified") -> _Snapshot:
         """Load full alert snapshot from Postgres. Always logs — use for cache-miss alerts."""
@@ -647,7 +671,10 @@ class AlertReadCache:
     def invalidate(self) -> None:
         """Drop shared snapshot so the next read rebuilds (stampede-locked)."""
         if self._redis:
-            self._redis.delete(self._snapshot_key)
+            try:
+                self._redis.delete(self._snapshot_key)
+            except Exception as exc:  # noqa: BLE001
+                self._redis_error("DELETE snapshot", exc)
         with self._local_lock:
             self._local = _Snapshot()
 

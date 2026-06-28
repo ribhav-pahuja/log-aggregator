@@ -85,6 +85,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: alert-redis
+    # Avoid MISCONF stop-writes when RDB can't flush on constrained Docker volumes
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--stop-writes-on-bgsave-error", "no"]
     ports:
       - "6379:6379"
     healthcheck:
