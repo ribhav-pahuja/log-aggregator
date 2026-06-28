@@ -347,6 +347,8 @@ class AlertReadCache:
         self._token = str(uuid.uuid4())
         self._local = _Snapshot()
         self._local_lock = threading.RLock()
+        self._db_fetch_count = 0
+        self._db_fetch_lock = threading.Lock()
 
         try:
             import redis
@@ -436,7 +438,29 @@ class AlertReadCache:
             except Exception:  # noqa: BLE001 — redis WatchError etc.
                 continue
 
-    def _load_from_db(self) -> _Snapshot:
+    def _load_from_db(self, *, reason: str = "unspecified") -> _Snapshot:
+        """Load full alert snapshot from Postgres. Always logs — use for cache-miss alerts."""
+        with self._db_fetch_lock:
+            self._db_fetch_count += 1
+            fetch_n = self._db_fetch_count
+
+        # Distinct marker line for log-based alerts / metrics scrapers:
+        #   ALERT_DB_FETCH  or  event=alert_ui_db_fetch
+        logger.warning(
+            "ALERT_DB_FETCH event=alert_ui_db_fetch reason=%s fetch_count=%s "
+            "backend=%s ttl_seconds=%s — UI/cache is hitting Postgres to load alerts "
+            "(not served purely from Redis cache)",
+            reason,
+            fetch_n,
+            self._backend,
+            self.ttl_seconds,
+        )
+        logger.info(
+            "Loading alerts from database reason=%s fetch_count=%s",
+            reason,
+            fetch_n,
+        )
+
         now = time.time()
         snap = _Snapshot(
             loaded_at_unix=now,
@@ -585,7 +609,7 @@ class AlertReadCache:
                 time.sleep(0.05)
             # Timed out waiting — last resort single DB read (rare)
             logger.warning("Cache lock wait timed out; loading DB without lock")
-            snap = self._load_from_db()
+            snap = self._load_from_db(reason="lock_wait_timeout")
             with self._local_lock:
                 snap.generation = self._local.generation + 1
                 self._local = snap
@@ -604,16 +628,18 @@ class AlertReadCache:
                         self._local = existing
                     return
 
-            snap = self._load_from_db()
+            reason = "force_refresh" if force else "ttl_expired_or_missing"
+            snap = self._load_from_db(reason=reason)
             with self._local_lock:
                 snap.generation = self._local.generation + 1
                 self._local = snap
             self._write_redis_snapshot(snap)
-            logger.debug(
-                "Redis snapshot refreshed generation=%s alerts=%s ttl=%ss",
+            logger.info(
+                "Redis snapshot refreshed generation=%s alerts=%s ttl=%ss reason=%s",
                 snap.generation,
                 len(snap.alerts),
                 self.ttl_seconds,
+                reason,
             )
         finally:
             self._release_lock()
@@ -635,8 +661,8 @@ class AlertReadCache:
             with self._local_lock:
                 if self._local.alerts or self._local.loaded_at_unix:
                     return self._local
-            # Memory fallback path
-            snap = self._load_from_db()
+            # Memory fallback path (no Redis or empty after failed refresh)
+            snap = self._load_from_db(reason="ensure_fresh_empty_fallback")
             with self._local_lock:
                 self._local = snap
             return snap
@@ -768,6 +794,8 @@ class AlertReadCache:
         with self._local_lock:
             local_gen = self._local.generation
             local_n = len(self._local.alerts)
+        with self._db_fetch_lock:
+            db_fetches = self._db_fetch_count
         return {
             "source": self._backend,
             "snapshot_key": self._snapshot_key,
@@ -779,6 +807,8 @@ class AlertReadCache:
             "local_generation": local_gen,
             "local_alert_count": local_n,
             "redis_alert_count": len(snap.alerts) if snap else 0,
+            "db_fetch_count": db_fetches,
+            "db_fetch_log_marker": "ALERT_DB_FETCH",
         }
 
 
