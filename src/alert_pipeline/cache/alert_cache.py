@@ -756,7 +756,7 @@ class AlertReadCache:
         service: str | None = None,
         q: str | None = None,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = 10,
     ) -> Page:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))

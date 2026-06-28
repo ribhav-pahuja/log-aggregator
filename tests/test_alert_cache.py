@@ -59,6 +59,11 @@ def test_memory_fallback_loads_and_paginates(tmp_path):
     assert page1.has_prev is False
     assert page1.pages == 3
 
+    # default page_size is 10
+    default_page = cache.list_alerts_page(page=1)
+    assert default_page.page_size == 10
+    assert len(default_page.items) == 5  # only 5 seeded
+
     page2 = cache.list_alerts_page(page=2, page_size=2)
     assert len(page2.items) == 2
     assert page2.has_prev is True

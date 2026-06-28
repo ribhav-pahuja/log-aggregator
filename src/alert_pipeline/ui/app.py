@@ -245,7 +245,7 @@ def create_app() -> FastAPI:
         service: str | None = Query(None),
         q: str | None = Query(None),
         page: int = Query(1, ge=1),
-        page_size: int = Query(50, ge=1, le=200),
+        page_size: int = Query(10, ge=1, le=200),
         # legacy aliases
         limit: int | None = Query(None, ge=1, le=200),
         offset: int | None = Query(None, ge=0),

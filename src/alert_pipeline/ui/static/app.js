@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { alerts: [], selectedId: null, timer: null, busy: false, page: 1, pageSize: 50, total: 0, pages: 0 };
+  const state = { alerts: [], selectedId: null, timer: null, busy: false, page: 1, pageSize: 10, total: 0, pages: 0 };
 
   function qs() {
     const params = new URLSearchParams();
@@ -13,7 +13,7 @@
     if (service) params.set("service", service);
     if (q) params.set("q", q);
     params.set("page", String(state.page || 1));
-    params.set("page_size", String(state.pageSize || 50));
+    params.set("page_size", String(state.pageSize || 10));
     return params.toString();
   }
 
