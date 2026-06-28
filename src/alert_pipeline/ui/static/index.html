@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alert Pipeline</title>
+  <link rel="stylesheet" href="/static/styles.css?v=5" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <h1>Alert Pipeline</h1>
+          <p class="sub">Empty slate · fire demos · ack / resolve · TTA / TTR</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <label class="toggle">
+          <input type="checkbox" id="autoRefresh" checked />
+          <span>Auto-refresh</span>
+        </label>
+        <span id="lastRefresh" class="muted">—</span>
+        <button type="button" id="btnRefresh" class="btn">Refresh</button>
+      </div>
+    </header>
+
+    <section class="demo-panel" id="demoPanel">
+      <div class="demo-head">
+        <h2>Demo controls</h2>
+        <p class="muted">Alerts are written to the database immediately when you fire (reliable for demos). Optional Kafka publish runs the full pipeline in parallel.</p>
+      </div>
+      <form id="demoForm" class="demo-form" action="#" method="post">
+        <label>Service
+          <input id="demo_service" name="service" value="payments-api" required />
+        </label>
+        <label>Severity
+          <select id="demo_severity" name="demo_severity">
+            <option>ERROR</option>
+            <option>CRITICAL</option>
+            <option>WARN</option>
+          </select>
+        </label>
+        <label>Error code
+          <input id="demo_error_code" name="error_code" value="DEMO" placeholder="optional" />
+        </label>
+        <label>Burst count
+          <input id="demo_count" name="count" type="number" min="1" max="20" value="1" />
+        </label>
+        <label class="demo-msg">Message
+          <input id="demo_message" name="message" value="connection refused while calling postgres" required />
+        </label>
+        <label class="demo-check">
+          <input type="checkbox" id="demo_kafka" name="also_publish_kafka" />
+          Also publish to Kafka (optional E2E)
+        </label>
+        <div class="demo-actions">
+          <button type="submit" class="btn btn-ack btn-lg" id="btnFire">Fire alert</button>
+          <button type="button" class="btn btn-lg" id="btnFireBurst">Fire ×5 (dedup demo)</button>
+          <button type="button" class="btn btn-lg danger" id="btnReset">Clear all alerts</button>
+        </div>
+      </form>
+      <p id="demoStatus" class="muted demo-status"></p>
+    </section>
+
+    <section class="stats" id="stats">
+      <div class="stat"><span class="stat-label">Total</span><span class="stat-value" data-k="total">0</span></div>
+      <div class="stat open"><span class="stat-label">Open</span><span class="stat-value" data-k="open">0</span></div>
+      <div class="stat updated"><span class="stat-label">Updated</span><span class="stat-value" data-k="updated">0</span></div>
+      <div class="stat ack"><span class="stat-label">Acked</span><span class="stat-value" data-k="acknowledged">0</span></div>
+      <div class="stat resolved"><span class="stat-label">Resolved</span><span class="stat-value" data-k="resolved">0</span></div>
+      <div class="stat sev"><span class="stat-label">Error+</span><span class="stat-value" data-k="critical_or_error">0</span></div>
+      <div class="stat ok"><span class="stat-label">Dispatch OK</span><span class="stat-value" data-k="dispatches_ok">0</span></div>
+      <div class="stat fail"><span class="stat-label">Dispatch fail</span><span class="stat-value" data-k="dispatches_fail">0</span></div>
+    </section>
+
+    <section class="filters">
+      <input type="search" id="q" placeholder="Search title, message, service, fingerprint…" />
+      <select id="status">
+        <option value="" selected>All statuses</option>
+        <option value="open,updated,acknowledged">Active (open / updated / acked)</option>
+        <option value="open">Open</option>
+        <option value="updated">Updated</option>
+        <option value="acknowledged">Acknowledged</option>
+        <option value="resolved">Resolved</option>
+      </select>
+      <select id="severity">
+        <option value="">All severities</option>
+        <option value="CRITICAL,FATAL">Critical / Fatal</option>
+        <option value="ERROR">Error</option>
+        <option value="WARN,WARNING">Warn</option>
+      </select>
+      <select id="service">
+        <option value="">All services</option>
+      </select>
+    </section>
+
+    <main class="layout">
+      <section class="panel list-panel">
+        <div class="panel-head">
+          <h2>Incidents</h2>
+          <span id="listCount" class="muted">0</span>
+        </div>
+        <div id="alertList" class="alert-list"></div>
+        <div id="emptyState" class="empty">No alerts yet — use <strong>Fire alert</strong> above to create one.</div>
+      </section>
+
+      <section class="panel detail-panel" id="detailPanel">
+        <div class="detail-placeholder" id="detailPlaceholder">
+          <p>Select an incident to <strong>acknowledge</strong> or <strong>resolve</strong> it (TTA / TTR are stored on ack / resolve).</p>
+        </div>
+        <div id="detail" class="detail hidden"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js?v=5"></script>
+</body>
+</html>

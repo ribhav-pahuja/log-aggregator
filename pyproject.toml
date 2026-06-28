@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alert-pipeline"
+version = "0.1.0"
+description = "Kafka-based alert deduplication and multi-destination dispatch pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "quixstreams>=3.5.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0",
+    "uvicorn[standard]>=0.27.0",
+    "fastapi>=0.110.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+flink = [
+    "apache-flink==1.19.1",
+]
+
+[project.scripts]
+alert-pipeline = "alert_pipeline.main:main"
+log-producer = "alert_pipeline.sample_producer:main"
+alert-ui = "alert_pipeline.ui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+alert_pipeline = ["ui/static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"

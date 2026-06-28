@@ -1,0 +1,57 @@
+# Alert pipeline behaviour — refiring, dedup windows, thresholds, fingerprint fields.
+# Override path with ALERT_CONFIG_PATH (default: config/alerts.yaml or /config/alerts.yaml in Docker).
+#
+# dedup_fields — which LogEvent attributes form the dedup fingerprint.
+# Supported values:
+#   service, level (or severity), message, labels, error_code, host, trace_id
+#   label:<name>   e.g. label:env   (single label key; also accepts labels.env)
+#
+# Only fields listed participate. Change message/labels (if included) → new incident group.
+
+version: 1
+
+defaults:
+  min_level: ERROR
+  dedup_window_seconds: 300
+  refire_interval_seconds: 60
+  suppress_dispatch_while_acknowledged: true
+  allow_reopen_after_resolve: true
+
+  # Default: group by labels + message (scoped by service/level)
+  dedup_fields:
+    - service
+    - level
+    - labels
+    - message
+
+services:
+  payments-api:
+    min_level: ERROR
+    dedup_window_seconds: 600
+    refire_interval_seconds: 120
+    suppress_dispatch_while_acknowledged: true
+    # Example: collapse everything for this service by error_code only
+    # dedup_fields:
+    #   - service
+    #   - error_code
+
+  checkout:
+    dedup_window_seconds: 180
+    refire_interval_seconds: 30
+    # Example: only env label + message
+    # dedup_fields:
+    #   - label:env
+    #   - message
+
+  inventory:
+    min_level: CRITICAL
+    dedup_window_seconds: 900
+    refire_interval_seconds: 300
+
+error_codes:
+  DB_CONN:
+    dedup_window_seconds: 900
+    refire_interval_seconds: 180
+  RATE_LIMIT:
+    dedup_window_seconds: 120
+    refire_interval_seconds: 60
