@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from alert_pipeline.alert_config import get_alert_config
 from alert_pipeline.cache.alert_cache import AlertReadCache, CachedAlert, CachedDispatch
 from alert_pipeline.config import get_settings
-from alert_pipeline.db.models import AlertRecord, Base
+from alert_pipeline.db.models import AlertRecord, Base, WidgetRecord
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
 from alert_pipeline.metrics import apply_status_timestamps
@@ -105,6 +105,26 @@ class DemoFireOut(BaseModel):
     alert_id: str | None = None
     alerts: list[AlertOut] = Field(default_factory=list)
     note: str = ""
+
+
+class LabelSpec(BaseModel):
+    key: str
+    value: str = ""
+
+
+class WidgetIn(BaseModel):
+    title: str
+    labels: list[LabelSpec] = Field(default_factory=list)
+    status_filter: str = "open,updated,acknowledged"
+    sort_order: int = 0
+
+
+class WidgetOut(BaseModel):
+    id: str
+    title: str
+    labels: list[LabelSpec]
+    status_filter: str
+    sort_order: int
 
 
 class PageMeta(BaseModel):
@@ -248,6 +268,11 @@ def create_app() -> FastAPI:
         label_value: str | None = Query(
             None, description="Optional exact label value; omit to match any value for key"
         ),
+        labels: str | None = Query(
+            None,
+            description='JSON array of {"key","value"} — all must match (AND). '
+            'Example: [{"key":"env","value":"prod"},{"key":"team","value":"platform"}]',
+        ),
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=200),
         # legacy aliases
@@ -258,6 +283,20 @@ def create_app() -> FastAPI:
             page_size = limit
             if offset is not None:
                 page = (offset // page_size) + 1
+        multi_labels = None
+        if labels:
+            import json as _json
+
+            try:
+                parsed = _json.loads(labels)
+                if isinstance(parsed, list):
+                    multi_labels = [
+                        {"key": str(x.get("key", "")), "value": str(x.get("value", ""))}
+                        for x in parsed
+                        if isinstance(x, dict)
+                    ]
+            except _json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid labels JSON: {exc}") from exc
         pg = cache.list_alerts_page(
             status=status,
             severity=severity,
@@ -265,6 +304,7 @@ def create_app() -> FastAPI:
             q=q,
             label_key=label_key,
             label_value=label_value,
+            labels=multi_labels,
             page=page,
             page_size=page_size,
         )
@@ -340,6 +380,67 @@ def create_app() -> FastAPI:
     @app.get("/api/services", response_model=list[str])
     def services() -> list[str]:
         return cache.list_services()
+
+    def _widget_out(row: WidgetRecord) -> WidgetOut:
+        import json as _json
+
+        try:
+            raw = _json.loads(row.labels_json or "[]")
+        except _json.JSONDecodeError:
+            raw = []
+        specs = [
+            LabelSpec(key=str(x.get("key", "")), value=str(x.get("value", "")))
+            for x in raw
+            if isinstance(x, dict) and x.get("key")
+        ]
+        return WidgetOut(
+            id=row.id,
+            title=row.title,
+            labels=specs,
+            status_filter=row.status_filter or "",
+            sort_order=row.sort_order,
+        )
+
+    @app.get("/api/widgets", response_model=list[WidgetOut])
+    def list_widgets() -> list[WidgetOut]:
+        """Shared widgets (all UI servers / operators)."""
+        return [_widget_out(w) for w in repo.list_widgets()]
+
+    @app.post("/api/widgets", response_model=WidgetOut)
+    def create_widget(body: WidgetIn) -> WidgetOut:
+        if not body.labels:
+            raise HTTPException(status_code=400, detail="At least one label filter is required")
+        row = repo.upsert_widget(
+            widget_id=None,
+            title=body.title.strip() or "Widget",
+            labels=[x.model_dump() for x in body.labels],
+            status_filter=body.status_filter or "",
+            sort_order=body.sort_order,
+        )
+        return _widget_out(row)
+
+    @app.put("/api/widgets/{widget_id}", response_model=WidgetOut)
+    def update_widget(widget_id: str, body: WidgetIn) -> WidgetOut:
+        if not body.labels:
+            raise HTTPException(status_code=400, detail="At least one label filter is required")
+        existing = repo.get_widget(widget_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Widget not found")
+        row = repo.upsert_widget(
+            widget_id=widget_id,
+            title=body.title.strip() or existing.title,
+            labels=[x.model_dump() for x in body.labels],
+            status_filter=body.status_filter or "",
+            sort_order=body.sort_order,
+        )
+        return _widget_out(row)
+
+    @app.delete("/api/widgets/{widget_id}")
+    def delete_widget(widget_id: str) -> dict[str, bool]:
+        ok = repo.delete_widget(widget_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Widget not found")
+        return {"deleted": True}
 
     @app.get("/api/dispatches/recent", response_model=DispatchPageOut)
     def recent_dispatches(

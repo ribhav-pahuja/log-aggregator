@@ -319,10 +319,16 @@ body {
 }
 .widget-form {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: 1fr 1fr;
   gap: 0.55rem;
   margin-bottom: 0.85rem;
   align-items: end;
+}
+.widget-labels-field { grid-column: 1 / -1; }
+.widget-labels-field textarea {
+  font: inherit; font-size: 0.85rem; text-transform: none; letter-spacing: normal;
+  color: var(--text); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0.45rem 0.55rem; resize: vertical; font-family: var(--mono);
 }
 .widget-form label {
   display: flex; flex-direction: column; gap: 0.25rem;

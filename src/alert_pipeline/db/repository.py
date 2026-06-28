@@ -9,9 +9,10 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from sqlalchemy import create_engine, delete, select, text
+import uuid
 from sqlalchemy.orm import Session, sessionmaker
 
-from alert_pipeline.db.models import AlertRecord, Base, DispatchLog
+from alert_pipeline.db.models import AlertRecord, Base, DispatchLog, WidgetRecord
 from alert_pipeline.metrics import apply_status_timestamps
 from alert_pipeline.schemas import ACTIVE_ALERT_STATUSES, AlertEvent
 
@@ -186,3 +187,64 @@ class AlertRepository:
                     error_message=(error_message or "")[:2000] or None,
                 )
             )
+
+    # --- shared dashboard widgets -------------------------------------------------
+
+    def list_widgets(self) -> list[WidgetRecord]:
+        with self.session() as session:
+            rows = session.scalars(
+                select(WidgetRecord).order_by(WidgetRecord.sort_order, WidgetRecord.title)
+            ).all()
+            for r in rows:
+                session.expunge(r)
+            return list(rows)
+
+    def get_widget(self, widget_id: str) -> WidgetRecord | None:
+        with self.session() as session:
+            row = session.get(WidgetRecord, widget_id)
+            if row:
+                session.expunge(row)
+            return row
+
+    def upsert_widget(
+        self,
+        *,
+        widget_id: str | None,
+        title: str,
+        labels: list[dict],
+        status_filter: str = "",
+        sort_order: int = 0,
+    ) -> WidgetRecord:
+        import json as _json
+
+        wid = widget_id or str(uuid.uuid4())
+        payload = _json.dumps(labels or [])
+        with self.session() as session:
+            row = session.get(WidgetRecord, wid)
+            if row is None:
+                row = WidgetRecord(
+                    id=wid,
+                    title=title,
+                    labels_json=payload,
+                    status_filter=status_filter or "",
+                    sort_order=sort_order,
+                )
+                session.add(row)
+            else:
+                row.title = title
+                row.labels_json = payload
+                row.status_filter = status_filter or ""
+                row.sort_order = sort_order
+            session.flush()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def delete_widget(self, widget_id: str) -> bool:
+        with self.session() as session:
+            row = session.get(WidgetRecord, widget_id)
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+

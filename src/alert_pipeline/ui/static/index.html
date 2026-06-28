@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Alert Pipeline</title>
-  <link rel="stylesheet" href="/static/styles.css?v=7" />
+  <link rel="stylesheet" href="/static/styles.css?v=8" />
 </head>
 <body>
   <div class="app">
@@ -98,18 +98,12 @@
 
     <section class="widgets-panel" id="widgetsPanel">
       <div class="demo-head">
-        <h2>Label widgets</h2>
-        <p class="muted">User-defined boards filtered by label key/value (saved in this browser). Each widget loads its own paginated alert list.</p>
+        <h2>Shared label widgets</h2>
+        <p class="muted">Stored in Postgres — all UI servers and operators see the same boards. Each widget can require <strong>multiple labels (AND)</strong>.</p>
       </div>
       <form id="widgetForm" class="widget-form" action="#" method="post">
         <label>Title
-          <input id="widget_title" placeholder="e.g. Prod env" required />
-        </label>
-        <label>Label key
-          <input id="widget_label_key" placeholder="env" value="env" required />
-        </label>
-        <label>Label value (optional)
-          <input id="widget_label_value" placeholder="prod — empty = any value" />
+          <input id="widget_title" placeholder="e.g. Prod platform team" required />
         </label>
         <label>Status filter
           <select id="widget_status">
@@ -119,8 +113,12 @@
             <option value="resolved">Resolved</option>
           </select>
         </label>
+        <label class="widget-labels-field">Labels (one per line: key=value; omit =value for any)
+          <textarea id="widget_labels" rows="3" placeholder="env=prod&#10;team=platform&#10;source" required>env=local
+source=ui-demo</textarea>
+        </label>
         <div class="demo-actions">
-          <button type="submit" class="btn btn-ack" id="btnAddWidget">Add widget</button>
+          <button type="submit" class="btn btn-ack" id="btnAddWidget">Add shared widget</button>
         </div>
       </form>
       <div id="widgetsGrid" class="widgets-grid"></div>
@@ -149,6 +147,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

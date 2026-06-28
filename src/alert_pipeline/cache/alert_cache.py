@@ -717,6 +717,7 @@ class AlertReadCache:
         q: str | None = None,
         label_key: str | None = None,
         label_value: str | None = None,
+        labels: list[dict[str, str]] | None = None,
     ) -> list[CachedAlert]:
         snap = self._ensure_fresh()
         items = list(snap.alerts.values())
@@ -733,20 +734,33 @@ class AlertReadCache:
                 items = [a for a in items if a.severity.upper() in sevs]
         if service:
             items = [a for a in items if a.service == service]
-        if label_key:
-            lk = label_key.strip().lower()
-            lv = (label_value or "").strip().lower()
 
-            def label_match(a: CachedAlert) -> bool:
-                for k, v in (a.labels or {}).items():
-                    if str(k).lower() != lk:
-                        continue
-                    if not lv:
-                        return True
-                    return str(v).lower() == lv
-                return False
+        # Multi-label AND: every {key,value} must match (empty value = any for that key)
+        label_specs: list[tuple[str, str]] = []
+        if labels:
+            for spec in labels:
+                if not isinstance(spec, dict):
+                    continue
+                k = str(spec.get("key") or "").strip().lower()
+                if not k:
+                    continue
+                v = str(spec.get("value") or "").strip().lower()
+                label_specs.append((k, v))
+        elif label_key:
+            label_specs.append((label_key.strip().lower(), (label_value or "").strip().lower()))
 
-            items = [a for a in items if label_match(a)]
+        if label_specs:
+
+            def all_labels_match(a: CachedAlert) -> bool:
+                al = {str(k).lower(): str(v).lower() for k, v in (a.labels or {}).items()}
+                for lk, lv in label_specs:
+                    if lk not in al:
+                        return False
+                    if lv and al[lk] != lv:
+                        return False
+                return True
+
+            items = [a for a in items if all_labels_match(a)]
         if q:
             needle = q.lower()
 
@@ -774,6 +788,7 @@ class AlertReadCache:
         q: str | None = None,
         label_key: str | None = None,
         label_value: str | None = None,
+        labels: list[dict[str, str]] | None = None,
         page: int = 1,
         page_size: int = 10,
     ) -> Page:
@@ -786,6 +801,7 @@ class AlertReadCache:
             q=q,
             label_key=label_key,
             label_value=label_value,
+            labels=labels,
         )
         total = len(items)
         start = (page - 1) * page_size

@@ -68,3 +68,23 @@ class DispatchLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+
+
+class WidgetRecord(Base):
+    """Shared dashboard widgets (visible to all UI instances)."""
+
+    __tablename__ = "dashboard_widgets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    # JSON list of {"key": "...", "value": "..."} — value empty means any
+    labels_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    status_filter: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+

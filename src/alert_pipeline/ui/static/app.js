@@ -457,29 +457,36 @@
     await refresh();
   };
 
-  const WIDGETS_KEY = "alert_pipeline_widgets_v1";
 
-  function loadWidgets() {
-    try {
-      const raw = localStorage.getItem(WIDGETS_KEY);
-      const arr = raw ? JSON.parse(raw) : [];
-      return Array.isArray(arr) ? arr : [];
-    } catch (_) {
-      return [];
+  function parseLabelsTextarea(text) {
+    const out = [];
+    for (const line of String(text || "").split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      const eq = s.indexOf("=");
+      if (eq === -1) out.push({ key: s, value: "" });
+      else out.push({ key: s.slice(0, eq).trim(), value: s.slice(eq + 1).trim() });
     }
+    return out.filter((x) => x.key);
   }
 
-  function saveWidgets(list) {
-    localStorage.setItem(WIDGETS_KEY, JSON.stringify(list));
+  function labelsSummary(labels) {
+    if (!labels || !labels.length) return "—";
+    return labels.map((l) => (l.value ? `${l.key}=${l.value}` : l.key)).join(" · ");
+  }
+
+  async function loadSharedWidgets() {
+    return fetchJSON("/api/widgets");
   }
 
   async function fetchWidgetAlerts(w) {
     const params = new URLSearchParams();
     params.set("page", "1");
     params.set("page_size", "10");
-    if (w.status) params.set("status", w.status);
-    if (w.label_key) params.set("label_key", w.label_key);
-    if (w.label_value) params.set("label_value", w.label_value);
+    if (w.status_filter) params.set("status", w.status_filter);
+    if (w.labels && w.labels.length) {
+      params.set("labels", JSON.stringify(w.labels));
+    }
     const data = await fetchJSON(`/api/alerts?${params}`);
     return Array.isArray(data) ? data : (data.items || []);
   }
@@ -487,9 +494,15 @@
   async function renderWidgets() {
     const grid = $("widgetsGrid");
     if (!grid) return;
-    const widgets = loadWidgets();
+    let widgets = [];
+    try {
+      widgets = await loadSharedWidgets();
+    } catch (err) {
+      grid.innerHTML = `<p class="muted fail-text">Failed to load widgets: ${escapeHtml(err.message)}</p>`;
+      return;
+    }
     if (!widgets.length) {
-      grid.innerHTML = `<p class="muted widget-empty">No widgets yet — add one with a label key (e.g. <code>env</code> = <code>prod</code>).</p>`;
+      grid.innerHTML = `<p class="muted widget-empty">No shared widgets yet — add one (multi-label AND, stored for everyone).</p>`;
       return;
     }
     grid.innerHTML = widgets
@@ -498,7 +511,7 @@
         <header>
           <div>
             <h3>${escapeHtml(w.title)}</h3>
-            <div class="meta">${escapeHtml(w.label_key)}${w.label_value ? `=${escapeHtml(w.label_value)}` : " (any value)"} · ${escapeHtml(w.status || "all")}</div>
+            <div class="meta">${escapeHtml(labelsSummary(w.labels))} · ${escapeHtml(w.status_filter || "all")}</div>
           </div>
           <button type="button" class="btn widget-remove" data-remove="${escapeHtml(w.id)}">Remove</button>
         </header>
@@ -508,10 +521,14 @@
       .join("");
 
     grid.querySelectorAll("[data-remove]").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", async () => {
         const id = btn.getAttribute("data-remove");
-        saveWidgets(loadWidgets().filter((x) => x.id !== id));
-        renderWidgets();
+        try {
+          await fetchJSON(`/api/widgets/${id}`, { method: "DELETE" });
+          await renderWidgets();
+        } catch (err) {
+          alert(err.message);
+        }
       });
     });
 
@@ -546,24 +563,26 @@
 
   const widgetForm = $("widgetForm");
   if (widgetForm) {
-    widgetForm.addEventListener("submit", (ev) => {
+    widgetForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const title = ($("widget_title") && $("widget_title").value.trim()) || "Widget";
-      const label_key = ($("widget_label_key") && $("widget_label_key").value.trim()) || "";
-      const label_value = ($("widget_label_value") && $("widget_label_value").value.trim()) || "";
-      const status = ($("widget_status") && $("widget_status").value) || "";
-      if (!label_key) return;
-      const list = loadWidgets();
-      list.push({
-        id: `w-${Date.now()}`,
-        title,
-        label_key,
-        label_value,
-        status,
-      });
-      saveWidgets(list);
-      if ($("widget_title")) $("widget_title").value = "";
-      renderWidgets();
+      const status_filter = ($("widget_status") && $("widget_status").value) || "";
+      const labels = parseLabelsTextarea($("widget_labels") && $("widget_labels").value);
+      if (!labels.length) {
+        alert("Add at least one label line (key or key=value)");
+        return;
+      }
+      try {
+        await fetchJSON("/api/widgets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, labels, status_filter, sort_order: 0 }),
+        });
+        if ($("widget_title")) $("widget_title").value = "";
+        await renderWidgets();
+      } catch (err) {
+        alert(err.message);
+      }
     });
   }
 
