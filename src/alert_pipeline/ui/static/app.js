@@ -311,7 +311,7 @@
 
   async function refresh({ keepSelection = false } = {}) {
     try {
-      await Promise.all([loadStats(), loadAlerts()]);
+      await Promise.all([loadStats(), loadAlerts(), renderWidgets()]);
       $("lastRefresh").textContent = `Updated ${new Date().toLocaleTimeString()}`;
       // Auto-select first alert so Acknowledge is always one click away in the detail pane
       if (state.alerts.length) {
@@ -456,6 +456,117 @@
     }
     await refresh();
   };
+
+  const WIDGETS_KEY = "alert_pipeline_widgets_v1";
+
+  function loadWidgets() {
+    try {
+      const raw = localStorage.getItem(WIDGETS_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function saveWidgets(list) {
+    localStorage.setItem(WIDGETS_KEY, JSON.stringify(list));
+  }
+
+  async function fetchWidgetAlerts(w) {
+    const params = new URLSearchParams();
+    params.set("page", "1");
+    params.set("page_size", "10");
+    if (w.status) params.set("status", w.status);
+    if (w.label_key) params.set("label_key", w.label_key);
+    if (w.label_value) params.set("label_value", w.label_value);
+    const data = await fetchJSON(`/api/alerts?${params}`);
+    return Array.isArray(data) ? data : (data.items || []);
+  }
+
+  async function renderWidgets() {
+    const grid = $("widgetsGrid");
+    if (!grid) return;
+    const widgets = loadWidgets();
+    if (!widgets.length) {
+      grid.innerHTML = `<p class="muted widget-empty">No widgets yet — add one with a label key (e.g. <code>env</code> = <code>prod</code>).</p>`;
+      return;
+    }
+    grid.innerHTML = widgets
+      .map(
+        (w) => `<article class="widget-card" data-wid="${escapeHtml(w.id)}">
+        <header>
+          <div>
+            <h3>${escapeHtml(w.title)}</h3>
+            <div class="meta">${escapeHtml(w.label_key)}${w.label_value ? `=${escapeHtml(w.label_value)}` : " (any value)"} · ${escapeHtml(w.status || "all")}</div>
+          </div>
+          <button type="button" class="btn widget-remove" data-remove="${escapeHtml(w.id)}">Remove</button>
+        </header>
+        <div class="widget-body" id="wbody-${escapeHtml(w.id)}"><p class="widget-empty">Loading…</p></div>
+      </article>`
+      )
+      .join("");
+
+    grid.querySelectorAll("[data-remove]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.getAttribute("data-remove");
+        saveWidgets(loadWidgets().filter((x) => x.id !== id));
+        renderWidgets();
+      });
+    });
+
+    await Promise.all(
+      widgets.map(async (w) => {
+        const body = document.getElementById(`wbody-${w.id}`);
+        if (!body) return;
+        try {
+          const items = await fetchWidgetAlerts(w);
+          if (!items.length) {
+            body.innerHTML = `<p class="widget-empty">No matching alerts</p>`;
+            return;
+          }
+          body.innerHTML = items
+            .map(
+              (a) => `<div class="widget-row" data-alert-id="${escapeHtml(a.id)}">
+              <span class="pill ${escapeHtml(a.status)}">${escapeHtml(a.status)}</span>
+              ${escapeHtml(a.service)} · ×${a.occurrence_count}<br/>
+              <span class="muted">${escapeHtml((a.title || "").slice(0, 80))}</span>
+            </div>`
+            )
+            .join("");
+          body.querySelectorAll("[data-alert-id]").forEach((row) => {
+            row.addEventListener("click", () => selectAlert(row.getAttribute("data-alert-id")));
+          });
+        } catch (err) {
+          body.innerHTML = `<p class="widget-empty fail-text">${escapeHtml(err.message)}</p>`;
+        }
+      })
+    );
+  }
+
+  const widgetForm = $("widgetForm");
+  if (widgetForm) {
+    widgetForm.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const title = ($("widget_title") && $("widget_title").value.trim()) || "Widget";
+      const label_key = ($("widget_label_key") && $("widget_label_key").value.trim()) || "";
+      const label_value = ($("widget_label_value") && $("widget_label_value").value.trim()) || "";
+      const status = ($("widget_status") && $("widget_status").value) || "";
+      if (!label_key) return;
+      const list = loadWidgets();
+      list.push({
+        id: `w-${Date.now()}`,
+        title,
+        label_key,
+        label_value,
+        status,
+      });
+      saveWidgets(list);
+      if ($("widget_title")) $("widget_title").value = "";
+      renderWidgets();
+    });
+  }
+
   const prev = $("btnPrevPage");
   const next = $("btnNextPage");
   if (prev) prev.addEventListener("click", () => {

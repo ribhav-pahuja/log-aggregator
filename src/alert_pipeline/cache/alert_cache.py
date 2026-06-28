@@ -715,9 +715,12 @@ class AlertReadCache:
         severity: str | None = None,
         service: str | None = None,
         q: str | None = None,
+        label_key: str | None = None,
+        label_value: str | None = None,
     ) -> list[CachedAlert]:
         snap = self._ensure_fresh()
         items = list(snap.alerts.values())
+        # Newest activity first (last_seen desc; ties use first_seen)
         items.sort(key=lambda a: a.last_seen or a.first_seen, reverse=True)
 
         if status:
@@ -730,6 +733,20 @@ class AlertReadCache:
                 items = [a for a in items if a.severity.upper() in sevs]
         if service:
             items = [a for a in items if a.service == service]
+        if label_key:
+            lk = label_key.strip().lower()
+            lv = (label_value or "").strip().lower()
+
+            def label_match(a: CachedAlert) -> bool:
+                for k, v in (a.labels or {}).items():
+                    if str(k).lower() != lk:
+                        continue
+                    if not lv:
+                        return True
+                    return str(v).lower() == lv
+                return False
+
+            items = [a for a in items if label_match(a)]
         if q:
             needle = q.lower()
 
@@ -755,13 +772,20 @@ class AlertReadCache:
         severity: str | None = None,
         service: str | None = None,
         q: str | None = None,
+        label_key: str | None = None,
+        label_value: str | None = None,
         page: int = 1,
         page_size: int = 10,
     ) -> Page:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         items = self._filtered_alerts(
-            status=status, severity=severity, service=service, q=q
+            status=status,
+            severity=severity,
+            service=service,
+            q=q,
+            label_key=label_key,
+            label_value=label_value,
         )
         total = len(items)
         start = (page - 1) * page_size

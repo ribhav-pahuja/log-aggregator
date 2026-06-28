@@ -244,6 +244,10 @@ def create_app() -> FastAPI:
         severity: str | None = Query(None),
         service: str | None = Query(None),
         q: str | None = Query(None),
+        label_key: str | None = Query(None, description="Filter by label key (e.g. env)"),
+        label_value: str | None = Query(
+            None, description="Optional exact label value; omit to match any value for key"
+        ),
         page: int = Query(1, ge=1),
         page_size: int = Query(10, ge=1, le=200),
         # legacy aliases
@@ -259,6 +263,8 @@ def create_app() -> FastAPI:
             severity=severity,
             service=service,
             q=q,
+            label_key=label_key,
+            label_value=label_value,
             page=page,
             page_size=page_size,
         )

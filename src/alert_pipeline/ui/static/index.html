@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Alert Pipeline</title>
-  <link rel="stylesheet" href="/static/styles.css?v=6" />
+  <link rel="stylesheet" href="/static/styles.css?v=7" />
 </head>
 <body>
   <div class="app">
@@ -96,6 +96,36 @@
       </select>
     </section>
 
+    <section class="widgets-panel" id="widgetsPanel">
+      <div class="demo-head">
+        <h2>Label widgets</h2>
+        <p class="muted">User-defined boards filtered by label key/value (saved in this browser). Each widget loads its own paginated alert list.</p>
+      </div>
+      <form id="widgetForm" class="widget-form" action="#" method="post">
+        <label>Title
+          <input id="widget_title" placeholder="e.g. Prod env" required />
+        </label>
+        <label>Label key
+          <input id="widget_label_key" placeholder="env" value="env" required />
+        </label>
+        <label>Label value (optional)
+          <input id="widget_label_value" placeholder="prod — empty = any value" />
+        </label>
+        <label>Status filter
+          <select id="widget_status">
+            <option value="open,updated,acknowledged">Active</option>
+            <option value="">All</option>
+            <option value="open">Open</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </label>
+        <div class="demo-actions">
+          <button type="submit" class="btn btn-ack" id="btnAddWidget">Add widget</button>
+        </div>
+      </form>
+      <div id="widgetsGrid" class="widgets-grid"></div>
+    </section>
+
     <main class="layout">
       <section class="panel list-panel">
         <div class="panel-head">
@@ -119,6 +149,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

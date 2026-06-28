@@ -309,3 +309,55 @@ body {
 
 .pager { display:flex; align-items:center; gap:0.4rem; }
 .pager .btn { padding:0.2rem 0.5rem; font-size:0.75rem; }
+
+.widgets-panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  margin-bottom: 1rem;
+}
+.widget-form {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.55rem;
+  margin-bottom: 0.85rem;
+  align-items: end;
+}
+.widget-form label {
+  display: flex; flex-direction: column; gap: 0.25rem;
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
+}
+.widget-form input, .widget-form select {
+  font: inherit; font-size: 0.88rem; text-transform: none; letter-spacing: normal;
+  color: var(--text); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0.4rem 0.5rem;
+}
+.widgets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.75rem;
+}
+.widget-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 160px;
+}
+.widget-card header {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 0.5rem; padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--border);
+}
+.widget-card header h3 { margin: 0; font-size: 0.9rem; }
+.widget-card header .meta { font-size: 0.72rem; color: var(--muted); }
+.widget-card .widget-body { padding: 0.35rem 0; flex: 1; max-height: 220px; overflow: auto; }
+.widget-card .widget-row {
+  padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--border);
+  font-size: 0.8rem; cursor: pointer;
+}
+.widget-card .widget-row:hover { background: var(--bg-elev-2); }
+.widget-card .widget-empty { padding: 0.75rem; color: var(--muted); font-size: 0.8rem; }
+.widget-card .widget-remove { font-size: 0.7rem; padding: 0.15rem 0.4rem; }
