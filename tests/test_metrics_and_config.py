@@ -2,7 +2,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from alert_pipeline.alert_config import load_alert_config
+from alert_pipeline.db.models import AlertRecord
 from alert_pipeline.db.repository import AlertRepository
+from alert_pipeline.metrics import apply_status_timestamps
 from alert_pipeline.schemas import AlertEvent, AlertStatus, LogEvent, LogLevel
 
 
@@ -26,11 +28,6 @@ def test_tta_ttr_persisted(tmp_path):
     row = repo.upsert_alert(alert)
     aid = row.id
 
-    # Simulate ack 90s later via repository
-    from alert_pipeline.db.models import AlertRecord
-    from alert_pipeline.metrics import apply_status_timestamps
-    from sqlalchemy import select
-
     with repo.session() as session:
         r = session.get(AlertRecord, aid)
         apply_status_timestamps(r, "acknowledged", now=t0 + timedelta(seconds=90))
@@ -45,6 +42,33 @@ def test_tta_ttr_persisted(tmp_path):
         assert r.status == "resolved"
         assert r.ttr_seconds == 300
         assert r.tta_seconds == 90
+
+
+def test_set_alert_status_sets_tta(tmp_path):
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/b.db")
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    row = repo.upsert_alert(
+        AlertEvent(
+            fingerprint="fp2",
+            title="t",
+            description="d",
+            severity=LogLevel.ERROR,
+            service="svc",
+            host="h",
+            status=AlertStatus.OPEN,
+            occurrence_count=1,
+            first_seen=t0,
+            last_seen=t0,
+            sample_message="m",
+            is_new=True,
+        )
+    )
+    # repository set_alert_status uses "now" — just assert status flips
+    updated = repo.set_alert_status(row.id, "acknowledged")
+    assert updated is not None
+    assert updated.status == "acknowledged"
+    assert updated.tta_seconds is not None
+    assert updated.acknowledged_at is not None
 
 
 def test_yaml_service_override():
