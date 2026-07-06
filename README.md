@@ -125,6 +125,8 @@ Mount path in containers: `/config/alerts.yaml` (`ALERT_CONFIG_PATH`).
 
 **URL:** [http://localhost:8000](http://localhost:8000)
 
+![Operator UI — shared widgets, incident list, and detail pane](docs/images/operator-ui.jpg)
+
 | Feature | Notes |
 | --- | --- |
 | Stats bar | Totals by status, dispatch ok/fail |
