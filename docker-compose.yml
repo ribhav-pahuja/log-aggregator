@@ -1,7 +1,8 @@
-# Full stack: Kafka + Postgres + alert pipeline (+ optional sample producer & webhook sink)
+# Full stack: Kafka + Postgres + Redis + alert pipeline + UI
 #
+#   cp .env.example .env   # required: DATABASE_URL / POSTGRES_*
 #   docker compose up --build
-#   docker compose --profile demo up --build   # also runs log-producer
+#   docker compose --profile demo up --build
 #   docker compose logs -f alert-pipeline
 
 services:
@@ -9,12 +10,10 @@ services:
     image: apache/kafka:3.8.1
     container_name: alert-kafka
     ports:
-      # Host clients (local producer/tests): localhost:9092
       - "9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      # Dual listeners: PLAINTEXT for host, PLAINTEXT_INTERNAL for Docker network
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
@@ -25,7 +24,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Topics are created only by kafka-init — never auto-create from a typo
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     healthcheck:
       test:
@@ -55,7 +55,12 @@ services:
           --topic logs \
           --partitions 3 \
           --replication-factor 1
-        echo "topic 'logs' ready"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists \
+          --topic logs-dlq \
+          --partitions 1 \
+          --replication-factor 1
+        echo "topics 'logs' and 'logs-dlq' ready"
     networks:
       - alert-net
     restart: "no"
@@ -66,13 +71,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: alerts
-      POSTGRES_PASSWORD: alerts
-      POSTGRES_DB: alerts
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env (see .env.example)}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U alerts -d alerts"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -80,12 +85,9 @@ services:
     networks:
       - alert-net
 
-  # Mock HTTP sink — enable DISPATCH_WEBHOOK_ENABLED on the app to inspect payloads
-
   redis:
     image: redis:7-alpine
     container_name: alert-redis
-    # Avoid MISCONF stop-writes when RDB can't flush on constrained Docker volumes
     command: ["redis-server", "--save", "", "--appendonly", "no", "--stop-writes-on-bgsave-error", "no"]
     ports:
       - "6379:6379"
@@ -97,6 +99,7 @@ services:
     networks:
       - alert-net
 
+  # Local echo sink — opt-in via DISPATCH_WEBHOOK_ENABLED=true
   webhook-debug:
     image: mendhak/http-https-echo:31
     container_name: alert-webhook-debug
@@ -108,7 +111,7 @@ services:
   alert-pipeline:
     build:
       context: .
-      dockerfile: ${PIPELINE_DOCKERFILE:-Dockerfile}
+      dockerfile: ${PIPELINE_DOCKERFILE:-Dockerfile.pipeline}
     image: ${PIPELINE_IMAGE:-alert-pipeline:local}
     container_name: alert-pipeline
     depends_on:
@@ -118,22 +121,28 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - path: .env
-        required: false
+        required: true
     volumes:
       - ./config/alerts.yaml:/config/alerts.yaml:ro
     environment:
       ALERT_CONFIG_PATH: /config/alerts.yaml
-      PIPELINE_RUNTIME: ${PIPELINE_RUNTIME:-quix}
-      FLINK_PARALLELISM: ${FLINK_PARALLELISM:-1}
-      FLINK_PRINT_RESULTS: ${FLINK_PRINT_RESULTS:-false}
-      FLINK_KAFKA_CONNECTOR_JAR: /opt/flink/lib/flink-sql-connector-kafka-3.2.0-1.19.jar
+      PIPELINE_RUNTIME: quix
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_INPUT_TOPIC: logs
-      KAFKA_CONSUMER_GROUP: alert-pipeline
-      KAFKA_AUTO_OFFSET_RESET: earliest
-      DATABASE_URL: postgresql+psycopg://alerts:alerts@postgres:5432/alerts
+      KAFKA_INPUT_TOPIC: ${KAFKA_INPUT_TOPIC:-logs}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-logs-dlq}
+      KAFKA_DLQ_ENABLED: ${KAFKA_DLQ_ENABLED:-true}
+      KAFKA_AUTO_CREATE_TOPICS: "false"
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-alert-pipeline}
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (see .env.example)}
+      # Redis: UI cache invalidation only (not pipeline dedup)
+      REDIS_URL: redis://redis:6379/0
+      # Dedup runs in Quix keyed state (group_by fingerprint)
+      DEDUP_BACKEND: ${DEDUP_BACKEND:-quix}
       DEDUP_WINDOW_SECONDS: ${DEDUP_WINDOW_SECONDS:-300}
       DEDUP_UPDATE_INTERVAL_SECONDS: ${DEDUP_UPDATE_INTERVAL_SECONDS:-60}
       ALERT_MIN_LEVEL: ${ALERT_MIN_LEVEL:-ERROR}
@@ -143,23 +152,24 @@ services:
       ZENDUTY_API_URL: ${ZENDUTY_API_URL:-https://www.zenduty.com/api/events}
       DISPATCH_TEAMS_ENABLED: ${DISPATCH_TEAMS_ENABLED:-false}
       TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
-      # Default: send to in-compose echo server so you can see dispatches without real APIs
-      DISPATCH_WEBHOOK_ENABLED: ${DISPATCH_WEBHOOK_ENABLED:-true}
+      # Opt-in: default false so compose does not surprise-fire webhooks
+      DISPATCH_WEBHOOK_ENABLED: ${DISPATCH_WEBHOOK_ENABLED:-false}
       WEBHOOK_URL: ${WEBHOOK_URL:-http://webhook-debug:8080/alerts}
       WEBHOOK_HEADERS_JSON: ${WEBHOOK_HEADERS_JSON:-{"Content-Type":"application/json"}}
+      UI_CACHE_INVALIDATE_ON_WRITE: "true"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       WAIT_FOR_KAFKA: "1"
       WAIT_FOR_POSTGRES: "1"
+      RUN_MIGRATIONS: "1"
     restart: unless-stopped
     networks:
       - alert-net
 
-  # Synthetic log traffic — opt-in: docker compose --profile demo up
   log-producer:
     profiles: ["demo"]
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.pipeline
     image: alert-pipeline:local
     container_name: alert-log-producer
     depends_on:
@@ -171,20 +181,22 @@ services:
         condition: service_started
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_INPUT_TOPIC: logs
+      KAFKA_INPUT_TOPIC: ${KAFKA_INPUT_TOPIC:-logs}
       WAIT_FOR_KAFKA: "1"
       WAIT_FOR_POSTGRES: "0"
+      RUN_MIGRATIONS: "0"
+      # Dummy URL so entrypoint does not require DB for the producer
+      DATABASE_URL: sqlite+pysqlite:////tmp/producer.db
     command: ["log-producer"]
     restart: unless-stopped
     networks:
       - alert-net
 
-
   alert-ui:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: alert-pipeline:local
+      dockerfile: Dockerfile.ui
+    image: alert-ui:local
     container_name: alert-ui
     depends_on:
       postgres:
@@ -195,19 +207,20 @@ services:
         condition: service_healthy
     env_file:
       - path: .env
-        required: false
+        required: true
     volumes:
       - ./config/alerts.yaml:/config/alerts.yaml:ro
     environment:
       ALERT_CONFIG_PATH: /config/alerts.yaml
-      DATABASE_URL: postgresql+psycopg://alerts:alerts@postgres:5432/alerts
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (see .env.example)}
       REDIS_URL: redis://redis:6379/0
-      UI_CACHE_TTL_SECONDS: "10"
+      UI_CACHE_TTL_SECONDS: ${UI_CACHE_TTL_SECONDS:-10}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_INPUT_TOPIC: logs
+      KAFKA_INPUT_TOPIC: ${KAFKA_INPUT_TOPIC:-logs}
       UI_PORT: "8000"
       WAIT_FOR_KAFKA: "1"
       WAIT_FOR_POSTGRES: "1"
+      RUN_MIGRATIONS: "1"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     command: ["alert-ui"]
     ports:
@@ -215,8 +228,6 @@ services:
     restart: unless-stopped
     networks:
       - alert-net
-
-
 
 networks:
   alert-net:

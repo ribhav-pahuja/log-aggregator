@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,12 +16,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    pipeline_runtime: Literal["quix", "flink", "quixstreams", "pyflink"] = "quix"
+    # Only Quix is supported (aliases kept for older .env values)
+    pipeline_runtime: Literal["quix", "quixstreams"] = "quix"
 
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_input_topic: str = "logs"
+    kafka_dlq_topic: str = "logs-dlq"
+    kafka_dlq_enabled: bool = True
     kafka_consumer_group: str = "alert-pipeline"
     kafka_auto_offset_reset: Literal["earliest", "latest"] = "earliest"
+    kafka_auto_create_topics: bool = False
 
     alert_config_path: str = "config/alerts.yaml"
 
@@ -29,10 +33,11 @@ class Settings(BaseSettings):
     dedup_update_interval_seconds: int = Field(default=60, ge=1)
     alert_min_level: str = "ERROR"
 
-    database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
+    # quix = Quix keyed state (production); memory = unit tests / in-process engine
+    # redis = deprecated for dedup (ignored)
+    dedup_backend: Literal["quix", "memory", "redis"] = "quix"
 
-    flink_parallelism: int = Field(default=1, ge=1)
-    flink_print_results: bool = False
+    database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
 
     dispatch_enabled: bool = True
     dispatch_zenduty_enabled: bool = False
@@ -46,14 +51,39 @@ class Settings(BaseSettings):
     webhook_url: str = ""
     webhook_headers_json: str = "{}"
 
-    # Shared UI read cache (Redis) — multi-instance consistent views
+    # UI read cache only (not pipeline dedup)
     redis_url: str = "redis://localhost:6379/0"
     ui_cache_ttl_seconds: float = Field(default=10.0, ge=1.0)
     ui_cache_lock_ttl_seconds: float = Field(default=5.0, ge=1.0)
     ui_cache_max_alerts: int = Field(default=2000, ge=100)
     ui_cache_key_prefix: str = "alert_ui"
+    ui_cache_invalidate_on_write: bool = True
 
     log_level: str = "INFO"
+
+    @field_validator("pipeline_runtime", mode="before")
+    @classmethod
+    def _normalize_runtime(cls, v: object) -> str:
+        if v is None or v == "":
+            return "quix"
+        name = str(v).strip().lower()
+        if name in ("flink", "pyflink"):
+            raise ValueError(
+                "PIPELINE_RUNTIME=flink is no longer supported. Use quix (default)."
+            )
+        if name in ("quixstreams",):
+            return "quixstreams"
+        return name
+
+    @field_validator("dedup_backend", mode="before")
+    @classmethod
+    def _normalize_backend(cls, v: object) -> str:
+        if v is None or v == "":
+            return "quix"
+        name = str(v).strip().lower()
+        if name in ("external", "quix-state", "state"):
+            return "quix"
+        return name
 
 
 @lru_cache

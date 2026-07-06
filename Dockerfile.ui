@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
-# Backward-compatible default image (full install: pipeline + UI).
-# Prefer Dockerfile.pipeline / Dockerfile.ui for production.
+# Operator UI image — FastAPI + static; no Quix/Flink.
 
 FROM python:3.12-slim AS base
 
@@ -31,7 +30,7 @@ COPY src ./src
 COPY alembic.ini ./
 COPY alembic ./alembic
 
-RUN pip install --prefix=/install ".[pipeline,ui]"
+RUN pip install --prefix=/install ".[ui]"
 
 FROM base AS runtime
 
@@ -47,11 +46,9 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
 USER appuser
 
 ENV ALERT_CONFIG_PATH=/config/alerts.yaml \
-    KAFKA_BOOTSTRAP_SERVERS=kafka:29092 \
-    KAFKA_INPUT_TOPIC=logs \
-    KAFKA_CONSUMER_GROUP=alert-pipeline \
+    UI_PORT=8000 \
     LOG_LEVEL=INFO \
     RUN_MIGRATIONS=1
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["alert-pipeline"]
+CMD ["alert-ui"]

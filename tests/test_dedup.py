@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from alert_pipeline.dedup.engine import DedupEngine
 from alert_pipeline.dedup.fingerprint import compute_fingerprint
+from alert_pipeline.dedup.store import MemoryDedupStore
 from alert_pipeline.schemas import LogEvent, LogLevel
 
 
@@ -75,12 +76,18 @@ def test_different_message_opens_new_incident():
 
 
 def test_dedup_emits_update_after_interval(monkeypatch):
-    engine = DedupEngine(window_seconds=300, update_interval_seconds=1)
+    store = MemoryDedupStore()
+    engine = DedupEngine(
+        window_seconds=300, update_interval_seconds=1, store=store
+    )
     first = engine.process(_err())
     assert first is not None
 
     fp = first.fingerprint
-    engine._state[fp].last_emitted_at = 0
+    st = store.get(fp)
+    assert st is not None
+    st.last_emitted_at = 0
+    store.put(st, ttl_seconds=300)
 
     upd = engine.process(_err())
     assert upd is not None

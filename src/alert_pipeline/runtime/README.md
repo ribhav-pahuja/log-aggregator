@@ -1,23 +1,21 @@
-# Stream runtimes
+# Stream runtime
 
-Business logic lives in `alert_pipeline.processing.AlertProcessor`.
-Runtimes only move bytes from Kafka into that processor.
+The only supported stream runtime is **Quix Streams**.
 
-| Runtime | Module | Env |
-| --- | --- | --- |
-| Quix Streams (default) | `quix_runtime.py` | `PIPELINE_RUNTIME=quix` |
-| Apache Flink (PyFlink) | `flink_runtime.py` | `PIPELINE_RUNTIME=flink` |
+- **Dedup:** Quix keyed state (`group_by(fingerprint)` + stateful apply) — `dedup/quix_state.py`
+- **Persist / dispatch:** `AlertProcessor.emit_alert`
+- **Redis:** UI read cache only
 
 ```bash
+pip install 'alert-pipeline[pipeline]'
 alert-pipeline
-
-pip install 'alert-pipeline[flink]'
-PIPELINE_RUNTIME=flink FLINK_PARALLELISM=1 alert-pipeline
 ```
 
-## Adding another engine
+## Quix repartition topics
 
-1. Class with `name` and `run(settings)` (`StreamRuntime` protocol).
-2. `AlertProcessor(settings)` once per task/worker.
-3. Each message → `processor.handle_payload(raw)`.
-4. Register in `factory._RUNTIMES`.
+`group_by` creates internal `repartition__*` / changelog topics via the Kafka Admin API.
+The Quix app enables `auto_create_topics=True` for those; broker-level auto-create can stay off.
+
+## DLQ
+
+Unparseable messages go to `KAFKA_DLQ_TOPIC` when enabled.

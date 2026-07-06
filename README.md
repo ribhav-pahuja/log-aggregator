@@ -4,7 +4,7 @@ Kafka → **deduplicate** noisy error logs into incidents → **PostgreSQL** (sy
 
 Includes an **operator UI** (ack / resolve, TTA/TTR, demo fire, **shared label widgets**) backed by a **Redis read cache** so multiple UI instances stay consistent.
 
-Built for a **Python** team with **pluggable stream runtimes**: **Quix Streams** (default) or **Apache Flink (PyFlink)**.
+Built for a **Python** team with **Quix Streams** (Kafka consumer + keyed-state dedup).
 
 Repository: [github.com/ribhav-pahuja/log-aggregator](https://github.com/ribhav-pahuja/log-aggregator)
 
@@ -14,63 +14,37 @@ Repository: [github.com/ribhav-pahuja/log-aggregator](https://github.com/ribhav-
 
 ```
                     ┌─────────────────────────────────┐
-  App logs ───────► │  Kafka topic: logs              │
+  App logs ───────► │  Kafka: logs  (+ logs-dlq)      │
                     └───────────────┬─────────────────┘
                                     │
               ┌─────────────────────┴─────────────────────┐
-              │  Stream runtime (choose one)                │
-              │  PIPELINE_RUNTIME=quix | flink              │
-              │  Quix Streams  OR  PyFlink (Dockerfile.flink)│
-              └─────────────────────┬─────────────────────┘
-                                    │ handle_payload()
-                                    ▼
-              ┌─────────────────────────────────────────┐
-              │  AlertProcessor (runtime-agnostic core)   │
-              │  • YAML dedup_fields + window/refire        │
-              │  • DedupEngine (fingerprint)              │
-              │  • Postgres upsert (alerts)               │
-              │  • Multi-API dispatch + dispatch_log      │
+              │  Quix Streams (Dockerfile.pipeline)         │
+              │  1. parse / min-level                       │
+              │  2. group_by(fingerprint)                   │
+              │  3. keyed-state dedup (window + refire)     │
+              │  4. emit → Postgres + dispatch              │
               └─────────────────────┬─────────────────────┘
                                     │
           ┌─────────────────────────┼─────────────────────────┐
           ▼                         ▼                         ▼
     PostgreSQL              Zenduty / Teams              Operator UI
-    alerts                  generic webhook              FastAPI :8000
-    dispatch_log            (pluggable)                    │
-    dashboard_widgets                                      │ reads
+    alerts (+ Alembic)      generic webhook              Dockerfile.ui
+    dispatch_log            (pluggable)                  FastAPI :8000
+    dashboard_widgets                                      │ reads / invalidate
                                                            ▼
-                                                    Redis snapshot cache
-                                                    TTL 10s + stampede lock
+                                                    Redis: UI snapshot cache only
 ```
 
-**Core idea:** business logic lives in `AlertProcessor` (`src/alert_pipeline/processing/`). Runtimes only move bytes from Kafka into that processor — so you can swap Quix ↔ Flink without rewriting dedup, DB, or dispatch.
+**Core idea:** **Dedup** runs in **Quix keyed state** (`group_by` + per-fingerprint state). `AlertProcessor` **persists** incidents and **dispatches** notifications. **Redis is only the UI read cache** (not used for dedup).
 
----
-
-## Quix vs Flink
-
-| | **Quix Streams** (default) | **Apache Flink (PyFlink)** |
-| --- | --- | --- |
-| Role | Python Kafka stream app | Distributed stream engine (embedded mini-cluster in our image) |
-| Ops | One container + Kafka + DB | Heavier image (JDK + Flink); prefer `Dockerfile.flink` |
-| Dedup state | In-process (+ DB as SoR) | Same processor; use **`FLINK_PARALLELISM=1`** unless you add shared state |
-| When to use | Day-to-day Python ownership | You already run Flink / need that runtime for policy reasons |
-
-Set the engine with:
-
-```bash
-PIPELINE_RUNTIME=quix    # default
-PIPELINE_RUNTIME=flink   # requires Flink image (see below)
-```
-
-Details: [`src/alert_pipeline/runtime/README.md`](src/alert_pipeline/runtime/README.md).
+**HLD:** [`docs/HLD.md`](docs/HLD.md)
 
 ---
 
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env          # optional: Zenduty/Teams keys
+cp .env.example .env          # required: POSTGRES_* and DATABASE_URL
 docker compose up --build -d  # kafka, postgres, redis, pipeline (Quix), UI
 
 # Dashboard
@@ -81,39 +55,22 @@ docker compose logs -f alert-pipeline
 
 # Optional synthetic Kafka traffic
 docker compose --profile demo up -d
+
+# Optional: enable webhook echo dispatches
+# DISPATCH_WEBHOOK_ENABLED=true in .env, then recreate alert-pipeline
 ```
 
 | Service | Role | Ports |
 | --- | --- | --- |
-| `kafka` | Log ingress | `9092` host / `kafka:29092` in-network |
-| `kafka-init` | Creates `logs` topic | — |
-| `postgres` | Alerts, dispatch audit, **shared widgets** | `5432` |
-| `redis` | **UI read cache** (multi-instance) | `6379` |
-| `alert-pipeline` | Dedup + DB + dispatch (`PIPELINE_RUNTIME`) | — |
-| `alert-ui` | Operator UI + APIs | **8000** |
-| `webhook-debug` | Echo sink for dry-run dispatches | `8080` |
+| `kafka` | Log ingress (auto-create topics **disabled**) | `9092` host / `kafka:29092` in-network |
+| `kafka-init` | Creates `logs` + `logs-dlq` | — |
+| `postgres` | Alerts, dispatch audit, **shared widgets** (Alembic on boot) | `5432` |
+| `redis` | **UI read cache only** (not pipeline dedup) | `6379` |
+| `alert-pipeline` | Dedup + DB + dispatch (`Dockerfile.pipeline`) | — |
+| `alert-ui` | Operator UI + APIs (`Dockerfile.ui`) | **8000** |
+| `webhook-debug` | Echo sink (opt-in via `DISPATCH_WEBHOOK_ENABLED`) | `8080` |
 | `log-producer` | Demo traffic (`--profile demo`) | — |
 
-### Run pipeline on Flink
-
-PyFlink is finicky on some host Python versions; use the dedicated image:
-
-```bash
-PIPELINE_DOCKERFILE=Dockerfile.flink \
-PIPELINE_IMAGE=alert-pipeline:flink \
-PIPELINE_RUNTIME=flink \
-FLINK_PARALLELISM=1 \
-docker compose up -d --build alert-pipeline
-```
-
-Switch back to Quix:
-
-```bash
-PIPELINE_DOCKERFILE=Dockerfile \
-PIPELINE_IMAGE=alert-pipeline:local \
-PIPELINE_RUNTIME=quix \
-docker compose up -d --build alert-pipeline
-```
 
 ### Tear down
 
@@ -128,10 +85,11 @@ docker compose --profile demo down -v
 ### Behaviour
 
 1. Only logs at or above the configured **min level** (default `ERROR`, from YAML / env) become incidents.
-2. Events sharing the same **fingerprint** within **`dedup_window_seconds`** collapse into one active incident (`occurrence_count` increases).
+2. Events sharing the same **fingerprint** within **`dedup_window_seconds`** collapse into one active incident (`occurrence_count` increases in Quix state; DB updates on emit).
 3. Optional **refire** every **`refire_interval_seconds`** can emit an `updated` notification (and dispatch), unless suppressed while **acknowledged**.
-4. After the window with no events, in-process state expires; the next match can open a **new** incident (DB row was resolved or none active).
+4. After the window with no events, Quix per-key state is treated as expired; the next match can open a **new** incident.
 5. **Host is not in the default fingerprint** (fleet-wide collapse). Add `host` in `dedup_fields` if you need per-node incidents.
+6. **Quix co-locates fingerprints** via `group_by` (creates internal `repartition__*` / changelog topics). **Redis is not used for dedup** — only for the operator UI snapshot cache.
 
 ### Configurable fingerprint fields (`config/alerts.yaml`)
 
@@ -324,7 +282,6 @@ See [`.env.example`](.env.example). Important variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PIPELINE_RUNTIME` | `quix` | `quix` or `flink` |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Brokers |
 | `KAFKA_INPUT_TOPIC` | `logs` | Source topic |
 | `DATABASE_URL` | SQLite tmp / Compose Postgres | SQLAlchemy URL |
@@ -332,7 +289,6 @@ See [`.env.example`](.env.example). Important variables:
 | `UI_CACHE_TTL_SECONDS` | `10` | Snapshot TTL |
 | `ALERT_CONFIG_PATH` | `config/alerts.yaml` | Dedup / refire YAML |
 | `DEDUP_WINDOW_SECONDS` | `300` | Fallback if YAML missing |
-| `FLINK_PARALLELISM` | `1` | PyFlink tasks (keep 1 without external dedup state) |
 | `DISPATCH_*` | — | Channel toggles and secrets |
 
 Behavioural tuning prefers **`config/alerts.yaml`** over env when both apply.
@@ -343,18 +299,23 @@ Behavioural tuning prefers **`config/alerts.yaml`** over env when both apply.
 
 ```
 src/alert_pipeline/
-  processing/handler.py   # AlertProcessor — portable core
-  runtime/                # quix_runtime, flink_runtime, factory
-  dedup/                  # fingerprint + DedupEngine
+  runtime/quix_runtime.py # Kafka → group_by → state dedup → emit
+  processing/handler.py   # AlertProcessor — persist + dispatch
+  dedup/
+    quix_state.py         # window/refire transitions (Quix State)
+    fingerprint.py        # hash + title
+    engine.py             # in-process engine (unit tests only)
   alert_config.py         # YAML load/merge
-  db/                     # models, repository
-  cache/alert_cache.py    # Redis (+ memory fallback) UI cache
+  db/                     # models, repository, Alembic-friendly schema
+  cache/alert_cache.py    # Redis UI snapshot cache
   dispatchers/            # Zenduty, Teams, webhook
   ui/                     # FastAPI + static dashboard
   metrics.py              # TTA/TTR on status change
 config/alerts.yaml
-Dockerfile                # Quix / default app image
-Dockerfile.flink          # PyFlink worker image
+alembic/                  # schema migrations
+Dockerfile.pipeline       # Quix pipeline image
+Dockerfile.ui             # UI image
+Dockerfile                # full/compat image
 docker-compose.yml
 tests/
 ```
@@ -364,14 +325,14 @@ tests/
 ## Development & tests
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # 3.11+; Flink optional extra needs 3.11 often
-pip install -e ".[dev]"
-# Optional Flink on host (prefer Docker image on macOS ARM / Python 3.12):
-# pip install -e ".[flink]"
+python -m venv .venv && source .venv/bin/activate   # 3.11+
+pip install -e ".[dev,pipeline,ui]"
 
 pytest -q
 # Cache / stampede / pagination:
 pytest -q tests/test_alert_cache.py
+# Quix-state dedup unit tests (no Kafka):
+pytest -q tests/test_quix_dedup_state.py
 ```
 
 Host pipeline against Compose infra:
@@ -380,10 +341,11 @@ Host pipeline against Compose infra:
 docker compose up -d kafka postgres redis webhook-debug
 export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 export DATABASE_URL=postgresql+psycopg://alerts:alerts@localhost:5432/alerts
-export REDIS_URL=redis://localhost:6379/0
+export REDIS_URL=redis://localhost:6379/0   # UI cache invalidation only
+export DEDUP_BACKEND=quix
 export DISPATCH_WEBHOOK_ENABLED=true
 export WEBHOOK_URL=http://localhost:8080/alerts
-alert-pipeline   # or PIPELINE_RUNTIME=flink with Flink deps/image
+alert-pipeline
 alert-ui
 ```
 
@@ -391,8 +353,10 @@ alert-ui
 
 ## Production notes
 
-- Prefer **PostgreSQL** and **Redis** for multi-UI deployments.
-- Pipeline dedup memory is **per process** — one consumer instance (or Flink parallelism 1) unless you add shared dedup state (e.g. Redis) inside `DedupEngine`.
+- **Stream runtime:** Quix only (Apache Flink support was removed).
+- **Dedup:** Quix per-key state after `group_by(fingerprint)` — not Redis, not in-process across workers.
+- Prefer **PostgreSQL** as system of record; run **Alembic** on deploy (`entrypoint` does `upgrade head`).
+- **Redis** is optional for multi-UI read caching; pipeline correctness does not depend on it for dedup.
 - Alert on log marker **`ALERT_DB_FETCH`** if UI cache miss rate is too high.
 - Tenacity retries (3× backoff) on HTTP dispatchers; failures are recorded in `dispatch_log`.
 - Do not commit real integration secrets; use `.env` locally only.
@@ -401,4 +365,4 @@ alert-ui
 
 ## License / contributing
 
-Open an issue or PR on the GitHub repo. Keep new stream engines behind `StreamRuntime` and route all event handling through `AlertProcessor`.
+Open an issue or PR on the GitHub repo. Keep business rules in `dedup/` + `AlertProcessor`; keep the Quix runtime as a thin Kafka/state adapter.

@@ -1,10 +1,10 @@
-"""Core processor works without any stream runtime."""
+"""Core processor works without the stream runtime stack."""
 
 from sqlalchemy import select
 
 from alert_pipeline.config import Settings
 from alert_pipeline.db.models import AlertRecord
-from alert_pipeline.processing.handler import AlertProcessor
+from alert_pipeline.processing.handler import AlertProcessor, parse_log_payload
 from alert_pipeline.runtime.factory import get_runtime
 
 
@@ -13,6 +13,8 @@ def test_processor_emits_then_dedups(tmp_path):
         database_url=f"sqlite+pysqlite:///{tmp_path}/p.db",
         dispatch_enabled=False,
         alert_config_path="config/alerts.yaml",
+        dedup_backend="memory",
+        ui_cache_invalidate_on_write=False,
     )
     proc = AlertProcessor(settings, reload_yaml=True)
     payload = {
@@ -24,11 +26,9 @@ def test_processor_emits_then_dedups(tmp_path):
     r1 = proc.handle_payload(payload)
     assert r1.emitted is True and r1.is_new is True
     r2 = proc.handle_payload(payload)
-    # Within refire window: no new alert event (in-memory dedup suppress)
     assert r2.emitted is False
     assert r2.skipped_reason == "dedup_suppressed"
 
-    # Important behavioral note: suppressed events do NOT upsert DB again
     with proc.repo.session() as session:
         row = session.scalar(select(AlertRecord).where(AlertRecord.id == r1.alert_id))
         assert row is not None
@@ -39,9 +39,21 @@ def test_processor_emits_then_dedups(tmp_path):
     assert r3.fingerprint != r1.fingerprint
 
 
-def test_factory_resolves_names():
+def test_unparseable_string_not_coerced_to_incident():
+    assert parse_log_payload("not-json-at-all") is None
+    assert parse_log_payload(b"\xff\xfe raw") is None
+
+
+def test_factory_resolves_quix():
     assert get_runtime("quix").name == "quix"
-    assert get_runtime("flink").name == "flink"
+    assert get_runtime("quixstreams").name == "quix"
+
+
+def test_factory_rejects_flink():
+    import pytest
+
+    with pytest.raises(ValueError, match="Flink support has been removed"):
+        get_runtime("flink")
 
 
 def test_factory_unknown_raises():

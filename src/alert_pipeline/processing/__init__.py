@@ -1,4 +1,4 @@
-"""Runtime-agnostic alert processing (shared by Quix, Flink, tests, UI demo)."""
+"""Alert processing (Quix runtime, unit tests, UI demo)."""
 
 from alert_pipeline.processing.handler import AlertProcessor, ProcessResult, parse_log_payload
 

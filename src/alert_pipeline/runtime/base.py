@@ -1,23 +1,17 @@
-"""Runtime port — implement this to add a new stream engine."""
+"""Stream runtime protocol."""
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from alert_pipeline.config import Settings
 
 
-@runtime_checkable
 class StreamRuntime(Protocol):
-    """
-    A stream runtime wires Kafka (or another source) to ``AlertProcessor``.
-
-    Implementations must not embed dedup/DB/dispatch logic — only I/O and
-    parallelism. That keeps Flink and Quix interchangeable.
-    """
+    """Kafka consumer adapter. Business logic stays in AlertProcessor / Quix state."""
 
     name: str
 
     def run(self, settings: Settings) -> None:
-        """Block and process until shutdown."""
+        """Block and process the input topic until shutdown."""
         ...

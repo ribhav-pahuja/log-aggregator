@@ -1,4 +1,4 @@
-"""CLI entrypoint: ``alert-pipeline`` — runtime selected via PIPELINE_RUNTIME."""
+"""CLI entrypoint: ``alert-pipeline`` — Quix Streams runtime."""
 
 from __future__ import annotations
 
@@ -17,7 +17,11 @@ def main() -> None:
         stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.info("pipeline_runtime=%s", settings.pipeline_runtime)
+    logging.info(
+        "pipeline_runtime=%s dedup_backend=%s",
+        settings.pipeline_runtime,
+        settings.dedup_backend,
+    )
     run_pipeline(settings)
 
 

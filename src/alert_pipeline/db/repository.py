@@ -10,6 +10,7 @@ from typing import Iterator
 
 from sqlalchemy import create_engine, delete, select, text
 import uuid
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_pipeline.db.models import AlertRecord, Base, DispatchLog, WidgetRecord
@@ -20,13 +21,10 @@ logger = logging.getLogger(__name__)
 
 _ACTIVE = tuple(ACTIVE_ALERT_STATUSES)
 
-# Lightweight additive migration for existing DBs created before TTA/TTR columns.
-_EXTRA_COLUMNS: list[tuple[str, str]] = [
-    ("acknowledged_at", "TIMESTAMP WITH TIME ZONE"),
-    ("resolved_at", "TIMESTAMP WITH TIME ZONE"),
-    ("tta_seconds", "INTEGER"),
-    ("ttr_seconds", "INTEGER"),
-]
+# Partial unique index: at most one active incident per fingerprint.
+# Status list must match ACTIVE_ALERT_STATUSES.
+_ACTIVE_FP_INDEX = "uq_alerts_active_fingerprint"
+_ACTIVE_FP_WHERE = "status IN ('open', 'updated', 'acknowledged')"
 
 
 class AlertRepository:
@@ -36,34 +34,33 @@ class AlertRepository:
             connect_args["check_same_thread"] = False
         self._engine = create_engine(database_url, future=True, connect_args=connect_args)
         self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
+        # Bootstrap for tests / first boot. Production should prefer Alembic
+        # (`alembic upgrade head`); create_all is idempotent and safe alongside it.
         Base.metadata.create_all(self._engine)
-        self._migrate_extra_columns(database_url)
+        self._ensure_active_fingerprint_index(database_url)
         logger.info(
             "Database ready: %s",
             database_url.split("@")[-1] if "@" in database_url else database_url,
         )
 
-    def _migrate_extra_columns(self, database_url: str) -> None:
+    def _ensure_active_fingerprint_index(self, database_url: str) -> None:
+        """Enforce one active row per fingerprint (multi-worker safety)."""
         is_sqlite = database_url.startswith("sqlite")
         with self._engine.begin() as conn:
             if is_sqlite:
-                existing = {
-                    row[1]
-                    for row in conn.execute(text("PRAGMA table_info(alerts)")).fetchall()
-                }
-                for col, _typ in _EXTRA_COLUMNS:
-                    if col not in existing:
-                        # SQLite: use generic types
-                        sql_type = "DATETIME" if "at" in col else "INTEGER"
-                        conn.execute(text(f"ALTER TABLE alerts ADD COLUMN {col} {sql_type}"))
-                        logger.info("Added column alerts.%s", col)
-            else:
-                for col, sql_type in _EXTRA_COLUMNS:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE alerts ADD COLUMN IF NOT EXISTS {col} {sql_type}"
-                        )
+                conn.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {_ACTIVE_FP_INDEX} "
+                        f"ON alerts (fingerprint) WHERE {_ACTIVE_FP_WHERE}"
                     )
+                )
+            else:
+                conn.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {_ACTIVE_FP_INDEX} "
+                        f"ON alerts (fingerprint) WHERE {_ACTIVE_FP_WHERE}"
+                    )
+                )
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -78,7 +75,23 @@ class AlertRepository:
             session.close()
 
     def upsert_alert(self, alert: AlertEvent) -> AlertRecord:
-        """Insert a new incident or refresh occurrence_count / last_seen for an open one."""
+        """Insert a new incident or refresh occurrence_count / last_seen for an open one.
+
+        Occurrence count never decreases: if the engine lost state and emits
+        ``is_new`` with count=1 while an active row exists, we bump the DB count
+        rather than resetting it.
+        """
+        try:
+            return self._upsert_once(alert)
+        except IntegrityError:
+            # Concurrent insert of same active fingerprint — retry as update
+            logger.info(
+                "Active fingerprint race for %s; retrying as update", alert.fingerprint
+            )
+            alert.is_new = False
+            return self._upsert_once(alert)
+
+    def _upsert_once(self, alert: AlertEvent) -> AlertRecord:
         with self.session() as session:
             existing = session.scalar(
                 select(AlertRecord).where(
@@ -109,7 +122,12 @@ class AlertRepository:
                 session.expunge(record)
                 return record
 
-            existing.occurrence_count = alert.occurrence_count
+            # Never decrease counts (restart / multi-worker safety)
+            if alert.is_new or alert.occurrence_count <= existing.occurrence_count:
+                existing.occurrence_count = existing.occurrence_count + 1
+            else:
+                existing.occurrence_count = alert.occurrence_count
+
             existing.last_seen = alert.last_seen
             if existing.status != "acknowledged":
                 existing.status = "updated"
@@ -120,6 +138,7 @@ class AlertRepository:
             session.flush()
             alert.id = existing.id
             alert.is_new = False
+            alert.occurrence_count = existing.occurrence_count
             session.expunge(existing)
             return existing
 
@@ -166,7 +185,6 @@ class AlertRepository:
             }
 
     def log_dispatch(
-
         self,
         *,
         alert_id: str,
@@ -247,4 +265,3 @@ class AlertRepository:
                 return False
             session.delete(row)
             return True
-

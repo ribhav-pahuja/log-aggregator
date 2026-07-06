@@ -8,30 +8,38 @@ version = "0.1.0"
 description = "Kafka-based alert deduplication and multi-destination dispatch pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
+# Shared core (pipeline + UI). Prefer a lockfile (requirements.lock) for prod images.
 dependencies = [
-    "quixstreams>=3.5.0",
-    "sqlalchemy>=2.0.0",
-    "psycopg[binary]>=3.1.0",
-    "httpx>=0.27.0",
-    "pydantic>=2.6.0",
-    "pydantic-settings>=2.2.0",
-    "python-dotenv>=1.0.0",
-    "tenacity>=8.2.0",
-    "uvicorn[standard]>=0.27.0",
-    "fastapi>=0.110.0",
-    "pyyaml>=6.0.0",
-    "redis>=5.0.0",
+    "sqlalchemy>=2.0.36,<3",
+    "psycopg[binary]>=3.2.3,<4",
+    "httpx>=0.27.2,<1",
+    "pydantic>=2.10.0,<3",
+    "pydantic-settings>=2.6.0,<3",
+    "python-dotenv>=1.0.1,<2",
+    "tenacity>=9.0.0,<10",
+    "pyyaml>=6.0.2,<7",
+    "redis>=5.2.0,<6",
+    "alembic>=1.14.0,<2",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "ruff>=0.3.0",
-    "fakeredis>=2.21.0",
+pipeline = [
+    "quixstreams>=3.5.0,<4",
 ]
-flink = [
-    "apache-flink==1.19.1",
+ui = [
+    "uvicorn[standard]>=0.32.0,<1",
+    "fastapi>=0.115.0,<1",
+]
+# Full local install (pipeline + UI)
+all = [
+    "alert-pipeline[pipeline,ui]",
+]
+dev = [
+    "pytest>=8.3.0,<9",
+    "pytest-asyncio>=0.24.0,<1",
+    "ruff>=0.8.0,<1",
+    "fakeredis>=2.26.0,<3",
+    "alert-pipeline[all]",
 ]
 
 [project.scripts]
