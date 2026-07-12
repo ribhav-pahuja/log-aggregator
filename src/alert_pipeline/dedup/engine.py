@@ -1,4 +1,7 @@
-"""Deduplication engine with pluggable store (memory or shared Redis)."""
+"""In-process deduplication engine (unit tests / non-Quix paths).
+
+Production dedup runs in Quix keyed state (``dedup/quix_state.py``).
+"""
 
 from __future__ import annotations
 
@@ -9,12 +12,7 @@ from uuid import uuid4
 
 from alert_pipeline.alert_config import AlertYamlConfig, RefireSettings, get_alert_config
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
-from alert_pipeline.dedup.store import (
-    DedupStore,
-    IncidentState,
-    MemoryDedupStore,
-    RedisDedupStore,
-)
+from alert_pipeline.dedup.store import DedupStore, IncidentState, MemoryDedupStore
 from alert_pipeline.schemas import (
     LEVEL_RANK,
     AlertEvent,
@@ -75,79 +73,6 @@ class DedupEngine:
 
         fingerprint = compute_fingerprint(event, cfg.dedup_fields)
         title = build_title(event)
-
-        # Fast path: Redis Lua does create/update/suppress atomically
-        if isinstance(self._store, RedisDedupStore):
-            return self._process_redis(event, cfg, fingerprint, title, now_ts)
-
-        return self._process_memory(event, cfg, fingerprint, title, now_ts)
-
-    def _process_redis(
-        self,
-        event: LogEvent,
-        cfg: RefireSettings,
-        fingerprint: str,
-        title: str,
-        now_ts: float,
-    ) -> AlertEvent | None:
-        assert isinstance(self._store, RedisDedupStore)
-        create_state = IncidentState(
-            alert_id=str(uuid4()),
-            fingerprint=fingerprint,
-            first_seen=event.timestamp,
-            last_seen=event.timestamp,
-            occurrence_count=1,
-            last_emitted_at=now_ts,
-            severity=event.level,
-            service=event.service,
-            host=event.host,
-            title=title,
-            sample_message=event.message,
-            error_code=event.error_code,
-            trace_id=event.trace_id,
-            labels=dict(event.labels),
-            window_seconds=cfg.dedup_window_seconds,
-        )
-        action, state = self._store.process_event(
-            fingerprint=fingerprint,
-            window_seconds=cfg.dedup_window_seconds,
-            refire_interval_seconds=cfg.refire_interval_seconds,
-            create_state=create_state,
-            event_severity=event.level.value,
-            event_last_seen=event.timestamp,
-            event_sample_message=event.message,
-            event_trace_id=event.trace_id,
-        )
-        if action == "new":
-            logger.info(
-                "New incident fingerprint=%s service=%s window=%ss backend=redis",
-                fingerprint,
-                event.service,
-                cfg.dedup_window_seconds,
-            )
-            return self._to_alert(
-                state, is_new=True, status=AlertStatus.OPEN, description=event.message
-            )
-        if action == "suppress":
-            logger.debug(
-                "Suppressed duplicate fingerprint=%s count=%s (redis)",
-                fingerprint,
-                state.occurrence_count,
-            )
-            return None
-        # update
-        return self._to_alert(
-            state, is_new=False, status=AlertStatus.UPDATED, description=event.message
-        )
-
-    def _process_memory(
-        self,
-        event: LogEvent,
-        cfg: RefireSettings,
-        fingerprint: str,
-        title: str,
-        now_ts: float,
-    ) -> AlertEvent | None:
         existing = self._store.get(fingerprint)
 
         if existing is None:

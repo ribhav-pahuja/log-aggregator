@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from alert_pipeline.dedup.engine import DedupEngine
 from alert_pipeline.dedup.fingerprint import compute_fingerprint
-from alert_pipeline.dedup.store import MemoryDedupStore
+from alert_pipeline.dedup.store import MemoryDedupStore, build_dedup_store
 from alert_pipeline.schemas import LogEvent, LogLevel
 
 
@@ -105,3 +107,13 @@ def test_dedup_emits_update_after_interval(monkeypatch):
 def test_info_logs_ignored():
     engine = DedupEngine(min_level=LogLevel.ERROR)
     assert engine.process(_err(level=LogLevel.INFO, message="all good")) is None
+
+
+def test_build_dedup_store_rejects_redis():
+    with pytest.raises(ValueError, match="redis was removed"):
+        build_dedup_store("redis")
+
+
+def test_build_dedup_store_memory():
+    store = build_dedup_store("memory")
+    assert isinstance(store, MemoryDedupStore)

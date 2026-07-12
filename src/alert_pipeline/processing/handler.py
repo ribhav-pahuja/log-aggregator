@@ -17,7 +17,7 @@ from alert_pipeline.alert_config import AlertYamlConfig, get_alert_config, reloa
 from alert_pipeline.config import Settings, get_settings
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.engine import DedupEngine
-from alert_pipeline.dedup.store import MemoryDedupStore, build_dedup_store
+from alert_pipeline.dedup.store import MemoryDedupStore
 from alert_pipeline.dispatchers.registry import (
     DispatchFanout,
     build_dispatchers,
@@ -114,24 +114,16 @@ class AlertProcessor:
             self.alert_config.defaults.min_level or self.settings.alert_min_level
         )
 
-        # Never use Redis for dedup. Memory engine is for unit tests only.
+        # In-process memory engine is for unit tests only. Production uses Quix state.
         if external_dedup:
             store = MemoryDedupStore()
             backend_label = "external (quix-state)"
         else:
             backend = self.settings.dedup_backend
-            if backend == "redis":
-                logger.warning(
-                    "DEDUP_BACKEND=redis is deprecated; using in-process memory. "
-                    "Quix runtime uses Quix keyed state. Redis is for UI cache only."
-                )
-                store = MemoryDedupStore()
-                backend_label = "memory (redis-dedup-disabled)"
-            elif backend in ("quix", "external"):
-                store = MemoryDedupStore()
+            store = MemoryDedupStore()
+            if backend in ("quix", "external"):
                 backend_label = "memory (use Quix runtime for quix-state)"
             else:
-                store = build_dedup_store("memory")
                 backend_label = "memory"
 
         self.engine = DedupEngine(

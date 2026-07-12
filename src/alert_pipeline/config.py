@@ -34,8 +34,7 @@ class Settings(BaseSettings):
     alert_min_level: str = "ERROR"
 
     # quix = Quix keyed state (production); memory = unit tests / in-process engine
-    # redis = deprecated for dedup (ignored)
-    dedup_backend: Literal["quix", "memory", "redis"] = "quix"
+    dedup_backend: Literal["quix", "memory"] = "quix"
 
     database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
 
@@ -92,6 +91,11 @@ class Settings(BaseSettings):
         name = str(v).strip().lower()
         if name in ("external", "quix-state", "state"):
             return "quix"
+        if name == "redis":
+            raise ValueError(
+                "DEDUP_BACKEND=redis was removed. Use 'quix' (production) or 'memory' "
+                "(tests). Redis remains for UI cache only (REDIS_URL)."
+            )
         return name
 
 
