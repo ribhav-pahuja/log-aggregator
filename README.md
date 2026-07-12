@@ -227,6 +227,25 @@ GET  /api/alerts/{id}/dispatches?page=1&page_size=50
 POST /api/alerts/{id}/ack
 POST /api/alerts/{id}/resolve
 POST /api/alerts/{id}/reopen
+```
+
+### Dead outbox (failed notifications)
+
+After max dispatch attempts, rows become `dead`. Operators can list, redrive (back to `pending`), or discard them.
+
+```http
+GET  /api/outbox/summary
+GET  /api/outbox?status=dead&page=1&page_size=50
+POST /api/outbox/redrive   {"ids":[1,2]}  or  {"all":true,"status":"dead"}
+POST /api/outbox/clear     {"ids":[1]}    or  {"all":true,"status":"dead"}
+```
+
+Prometheus: **`alert_pipeline_outbox_dead`** (gauge) and `alert_pipeline_outbox_processed_total{result="dead"}`. The UI has a **Dead outbox** panel on the main dashboard.
+
+**Demo:** UI button **Seed dead outbox** (or `POST /api/demo/seed-dead-outbox`) creates synthetic dead rows so you can exercise Redrive / Clear without waiting for real max-retry failures.
+
+```http
+# continued alerts API
 POST /api/alerts/{id}/status   {"status":"acknowledged"|"resolved"|"open"|...}
 GET  /api/stats
 GET  /api/services

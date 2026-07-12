@@ -16,10 +16,20 @@ import time
 from alert_pipeline.config import Settings, get_settings
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dispatchers.registry import DispatchFanout, build_dispatchers
-from alert_pipeline.observability import DISPATCH_ATTEMPTS, OUTBOX_PENDING, OUTBOX_PROCESSED
+from alert_pipeline.observability import (
+    DISPATCH_ATTEMPTS,
+    OUTBOX_DEAD,
+    OUTBOX_PENDING,
+    OUTBOX_PROCESSED,
+)
 from alert_pipeline.schemas import AlertEvent
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_outbox_gauges(repo: AlertRepository) -> None:
+    OUTBOX_PENDING.set(repo.count_outbox_open())
+    OUTBOX_DEAD.set(repo.count_outbox("dead"))
 
 
 def process_batch(
@@ -33,8 +43,7 @@ def process_batch(
         stale_processing_seconds=settings.dispatch_outbox_stale_processing_seconds,
     )
     if not rows:
-        pending = repo.count_outbox_open()
-        OUTBOX_PENDING.set(pending)
+        _refresh_outbox_gauges(repo)
         return 0
 
     handled = 0
@@ -83,7 +92,7 @@ def process_batch(
                 channel=row.channel, result="dead" if final == "dead" else "failed"
             ).inc()
 
-    OUTBOX_PENDING.set(repo.count_outbox_open())
+    _refresh_outbox_gauges(repo)
     return handled
 
 

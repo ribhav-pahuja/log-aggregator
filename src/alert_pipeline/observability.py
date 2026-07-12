@@ -47,7 +47,11 @@ if _PROM:
     )
     OUTBOX_PENDING = Gauge(
         "alert_pipeline_outbox_pending",
-        "Outbox rows in pending/processing",
+        "Outbox rows in pending/processing/failed (open work)",
+    )
+    OUTBOX_DEAD = Gauge(
+        "alert_pipeline_outbox_dead",
+        "Outbox rows in dead status (max attempts exhausted)",
     )
 else:  # pragma: no cover
 
@@ -67,6 +71,7 @@ else:  # pragma: no cover
     OUTBOX_PROCESSED = _Noop()  # type: ignore[assignment]
     DISPATCH_ATTEMPTS = _Noop()  # type: ignore[assignment]
     OUTBOX_PENDING = _Noop()  # type: ignore[assignment]
+    OUTBOX_DEAD = _Noop()  # type: ignore[assignment]
 
 
 def metrics_payload() -> tuple[bytes, str]:

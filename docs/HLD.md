@@ -582,7 +582,7 @@ Process logs for: new incident, suppress (debug), outbox enqueue, dispatch ok/fa
 | `alert_pipeline_outbox_pending` growth | Worker down or channel outage |
 | DLQ message rate / depth | Bad producers or schema drift |
 | Emit / upsert errors | SoR unavailable |
-| Dispatch failure / dead outbox rate | On-call noise or silent miss depending on channel |
+| Dispatch failure / dead outbox rate | Alert on `alert_pipeline_outbox_dead`; redrive/clear via `GET/POST /api/outbox*` or UI panel |
 | Pipeline / worker restart loops | State/config/image issues |
 
 ### 9.4 Testing strategy (design contracts)

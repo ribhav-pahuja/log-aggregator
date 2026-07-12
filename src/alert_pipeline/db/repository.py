@@ -485,6 +485,103 @@ class AlertRepository:
             )
             return int(n or 0)
 
+    def count_outbox(self, status: str | None = None) -> int:
+        """Count outbox rows; optional exact status filter (e.g. ``dead``)."""
+        with self.session() as session:
+            from sqlalchemy import func
+
+            q = select(func.count()).select_from(DispatchOutbox)
+            if status:
+                q = q.where(DispatchOutbox.status == status)
+            return int(session.scalar(q) or 0)
+
+    def outbox_status_counts(self) -> dict[str, int]:
+        """Counts keyed by status for operator dashboards."""
+        with self.session() as session:
+            from sqlalchemy import func
+
+            rows = session.execute(
+                select(DispatchOutbox.status, func.count()).group_by(DispatchOutbox.status)
+            ).all()
+            return {str(status): int(n) for status, n in rows}
+
+    def list_outbox(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[DispatchOutbox]:
+        """List outbox rows newest-first (operator view / dead-letter)."""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self.session() as session:
+            q = select(DispatchOutbox).order_by(
+                DispatchOutbox.updated_at.desc(), DispatchOutbox.id.desc()
+            )
+            if status:
+                q = q.where(DispatchOutbox.status == status)
+            rows = list(session.scalars(q.offset(offset).limit(limit)).all())
+            for r in rows:
+                session.expunge(r)
+            return rows
+
+    def redrive_outbox(
+        self,
+        *,
+        ids: list[int] | None = None,
+        status: str = "dead",
+        all_matching: bool = False,
+    ) -> int:
+        """Reset outbox rows to ``pending`` for another worker attempt.
+
+        Either pass explicit ``ids`` (must be ``dead`` or ``failed``) or
+        ``all_matching=True`` with a ``status`` filter (default ``dead``).
+        Resets ``attempts`` so max_attempts applies fully again.
+        """
+        if not all_matching and not ids:
+            return 0
+        now = datetime.now(timezone.utc)
+        with self.session() as session:
+            q = select(DispatchOutbox)
+            if all_matching:
+                q = q.where(DispatchOutbox.status == status)
+            else:
+                q = q.where(
+                    DispatchOutbox.id.in_(list(ids or [])),
+                    DispatchOutbox.status.in_(("dead", "failed")),
+                )
+            rows = list(session.scalars(q).all())
+            for row in rows:
+                row.status = "pending"
+                row.attempts = 0
+                row.next_attempt_at = now
+                row.last_error = None
+                row.updated_at = now
+            session.flush()
+            return len(rows)
+
+    def delete_outbox(
+        self,
+        *,
+        ids: list[int] | None = None,
+        status: str = "dead",
+        all_matching: bool = False,
+    ) -> int:
+        """Permanently delete outbox rows (typically dead-letter discard)."""
+        if not all_matching and not ids:
+            return 0
+        with self.session() as session:
+            if all_matching:
+                result = session.execute(
+                    delete(DispatchOutbox).where(DispatchOutbox.status == status)
+                )
+            else:
+                result = session.execute(
+                    delete(DispatchOutbox).where(DispatchOutbox.id.in_(list(ids or [])))
+                )
+            return int(result.rowcount or 0)
+
     # --- shared dashboard widgets -------------------------------------------------
 
     def list_widgets(self) -> list[WidgetRecord]:

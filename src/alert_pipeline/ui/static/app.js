@@ -69,6 +69,83 @@
     });
   }
 
+  async function loadOutboxDead() {
+    const deadEl = $("outboxDeadCount");
+    const body = $("outboxBody");
+    const statusEl = $("outboxStatus");
+    if (!body) return;
+    try {
+      const [summary, page] = await Promise.all([
+        fetchJSON("/api/outbox/summary"),
+        fetchJSON("/api/outbox?status=dead&page=1&page_size=50"),
+      ]);
+      if (deadEl) deadEl.textContent = String(summary.dead ?? 0);
+      const items = page.items || [];
+      if (!items.length) {
+        body.innerHTML = `<tr><td colspan="7" class="muted">No dead outbox rows</td></tr>`;
+        if (statusEl) statusEl.textContent = `Open work: ${summary.open ?? 0}`;
+        return;
+      }
+      body.innerHTML = items
+        .map(
+          (r) => `
+        <tr data-outbox-id="${r.id}">
+          <td>${r.id}</td>
+          <td>${escapeHtml(r.channel)}</td>
+          <td class="mono"><a href="#" data-alert-link="${escapeHtml(r.alert_id)}">${escapeHtml(r.alert_id.slice(0, 8))}…</a></td>
+          <td>${r.attempts}</td>
+          <td class="muted" title="${escapeHtml(r.last_error || "")}">${escapeHtml((r.last_error || "—").slice(0, 80))}</td>
+          <td>${fmtTime(r.updated_at)}</td>
+          <td class="row-actions">
+            <button type="button" class="btn btn-sm" data-outbox-act="redrive" data-id="${r.id}">Redrive</button>
+            <button type="button" class="btn btn-sm danger" data-outbox-act="clear" data-id="${r.id}">Clear</button>
+          </td>
+        </tr>`
+        )
+        .join("");
+      body.querySelectorAll("[data-outbox-act]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const id = Number(btn.getAttribute("data-id"));
+          const act = btn.getAttribute("data-outbox-act");
+          try {
+            if (act === "redrive") {
+              await fetchJSON("/api/outbox/redrive", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids: [id] }),
+              });
+              if (statusEl) statusEl.textContent = `Redrove outbox #${id}`;
+            } else {
+              if (!confirm(`Delete dead outbox row #${id}?`)) return;
+              await fetchJSON("/api/outbox/clear", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids: [id] }),
+              });
+              if (statusEl) statusEl.textContent = `Cleared outbox #${id}`;
+            }
+            await loadOutboxDead();
+          } catch (err) {
+            if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+          }
+        });
+      });
+      body.querySelectorAll("[data-alert-link]").forEach((a) => {
+        a.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          const id = a.getAttribute("data-alert-link");
+          if (id) selectAlert(id);
+        });
+      });
+      if (statusEl) {
+        statusEl.textContent = `${items.length} dead shown · open work ${summary.open ?? 0}`;
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Outbox load error: ${err.message}`;
+      console.error(err);
+    }
+  }
+
   async function loadServices() {
     const services = await fetchJSON("/api/services");
     const sel = $("service");
@@ -311,7 +388,7 @@
 
   async function refresh({ keepSelection = false } = {}) {
     try {
-      await Promise.all([loadStats(), loadAlerts(), renderWidgets()]);
+      await Promise.all([loadStats(), loadAlerts(), renderWidgets(), loadOutboxDead()]);
       $("lastRefresh").textContent = `Updated ${new Date().toLocaleTimeString()}`;
       // Auto-select first alert so Acknowledge is always one click away in the detail pane
       if (state.alerts.length) {
@@ -355,6 +432,44 @@
   $("btnRefresh").addEventListener("click", () => refresh({ keepSelection: true }));
   $("autoRefresh").addEventListener("change", schedule);
 
+  if ($("btnOutboxRefresh")) {
+    $("btnOutboxRefresh").addEventListener("click", () => loadOutboxDead());
+  }
+  if ($("btnOutboxRedriveAll")) {
+    $("btnOutboxRedriveAll").addEventListener("click", async () => {
+      if (!confirm("Redrive ALL dead outbox rows to pending?")) return;
+      const statusEl = $("outboxStatus");
+      try {
+        const r = await fetchJSON("/api/outbox/redrive", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true, status: "dead" }),
+        });
+        if (statusEl) statusEl.textContent = `Redrove ${r.affected} row(s)`;
+        await loadOutboxDead();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+      }
+    });
+  }
+  if ($("btnOutboxClearAll")) {
+    $("btnOutboxClearAll").addEventListener("click", async () => {
+      if (!confirm("Permanently DELETE all dead outbox rows?")) return;
+      const statusEl = $("outboxStatus");
+      try {
+        const r = await fetchJSON("/api/outbox/clear", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true, status: "dead" }),
+        });
+        if (statusEl) statusEl.textContent = `Cleared ${r.affected} row(s)`;
+        await loadOutboxDead();
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+      }
+    });
+  }
+
   async function demoReset() {
     if (!confirm("Delete ALL alerts and dispatch history? This cannot be undone.")) return;
     const statusEl = $("demoStatus");
@@ -367,6 +482,25 @@
       statusEl.textContent = `Cleared ${r.alerts_deleted} alerts, ${r.dispatch_log_deleted} dispatch rows.`;
     }
     await refresh();
+  }
+
+  async function demoSeedDead() {
+    const statusEl = $("demoStatus");
+    if (statusEl) statusEl.textContent = "Seeding dead outbox rows…";
+    try {
+      const r = await fetchJSON("/api/demo/seed-dead-outbox", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count: 3, channel: "webhook", mark_open_as_dead: true }),
+      });
+      if (statusEl) statusEl.textContent = r.note || `Dead total: ${r.dead_total}`;
+      await refresh();
+      // Scroll dead panel into view
+      const panel = $("outboxPanel");
+      if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Seed dead failed: ${err.message}`;
+    }
   }
 
   function readDemoForm(overrides = {}) {
@@ -427,6 +561,17 @@
     burst.addEventListener("click", (ev) => {
       ev.preventDefault();
       demoFire({ count: 5 }).catch((e) => {
+        const statusEl = $("demoStatus");
+        if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+        console.error(e);
+      });
+    });
+  }
+  const seedDeadBtn = $("btnSeedDead");
+  if (seedDeadBtn) {
+    seedDeadBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      demoSeedDead().catch((e) => {
         const statusEl = $("demoStatus");
         if (statusEl) statusEl.textContent = `Error: ${e.message}`;
         console.error(e);

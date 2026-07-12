@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Alert Pipeline</title>
-  <link rel="stylesheet" href="/static/styles.css?v=8" />
+  <link rel="stylesheet" href="/static/styles.css?v=9" />
 </head>
 <body>
   <div class="app">
@@ -58,6 +58,9 @@
         <div class="demo-actions">
           <button type="submit" class="btn btn-ack btn-lg" id="btnFire">Fire alert</button>
           <button type="button" class="btn btn-lg" id="btnFireBurst">Fire ×5 (dedup demo)</button>
+          <button type="button" class="btn btn-lg" id="btnSeedDead" title="Create dead outbox rows to try Redrive/Clear">
+            Seed dead outbox
+          </button>
           <button type="button" class="btn btn-lg danger" id="btnReset">Clear all alerts</button>
         </div>
       </form>
@@ -73,6 +76,41 @@
       <div class="stat sev"><span class="stat-label">Error+</span><span class="stat-value" data-k="critical_or_error">0</span></div>
       <div class="stat ok"><span class="stat-label">Dispatch OK</span><span class="stat-value" data-k="dispatches_ok">0</span></div>
       <div class="stat fail"><span class="stat-label">Dispatch fail</span><span class="stat-value" data-k="dispatches_fail">0</span></div>
+      <div class="stat fail"><span class="stat-label">Outbox dead</span><span class="stat-value" id="outboxDeadCount">0</span></div>
+    </section>
+
+    <section class="outbox-panel" id="outboxPanel">
+      <div class="demo-head">
+        <h2>Dead outbox (notifications)</h2>
+        <p class="muted">
+          Rows that exhausted retries. <strong>Redrive</strong> resets them to pending for the worker;
+          <strong>Clear</strong> discards them. Metric: <code>alert_pipeline_outbox_dead</code>.
+        </p>
+      </div>
+      <div class="demo-actions">
+        <button type="button" class="btn btn-ack" id="btnOutboxRefresh">Refresh dead</button>
+        <button type="button" class="btn" id="btnOutboxRedriveAll">Redrive all dead</button>
+        <button type="button" class="btn danger" id="btnOutboxClearAll">Clear all dead</button>
+      </div>
+      <p id="outboxStatus" class="muted demo-status"></p>
+      <div class="table-wrap">
+        <table class="dispatch-table" id="outboxTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Channel</th>
+              <th>Alert</th>
+              <th>Attempts</th>
+              <th>Error</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="outboxBody">
+            <tr><td colspan="7" class="muted">No dead outbox rows</td></tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="filters">

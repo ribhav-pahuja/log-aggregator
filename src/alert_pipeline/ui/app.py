@@ -108,6 +108,23 @@ class DemoFireOut(BaseModel):
     note: str = ""
 
 
+class DemoSeedDeadBody(BaseModel):
+    """Create synthetic dead outbox rows so the dead-letter UI can be exercised."""
+
+    count: int = Field(default=3, ge=1, le=20)
+    channel: str = "webhook"
+    # Also flip any pending/failed outbox rows to dead (e.g. after Fire alert)
+    mark_open_as_dead: bool = True
+
+
+class DemoSeedDeadOut(BaseModel):
+    created: int
+    marked_open: int
+    dead_total: int
+    outbox_ids: list[int] = Field(default_factory=list)
+    note: str = ""
+
+
 class LabelSpec(BaseModel):
     key: str
     value: str = ""
@@ -155,6 +172,48 @@ class DispatchPageOut(BaseModel):
     pages: int
     has_next: bool
     has_prev: bool
+
+
+class OutboxRowOut(BaseModel):
+    id: int
+    idempotency_key: str
+    alert_id: str
+    channel: str
+    status: str
+    attempts: int
+    next_attempt_at: datetime
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OutboxPageOut(BaseModel):
+    items: list[OutboxRowOut]
+    page: int
+    page_size: int
+    total: int
+    pages: int
+    has_next: bool
+    has_prev: bool
+
+
+class OutboxSummaryOut(BaseModel):
+    counts: dict[str, int]
+    open: int
+    dead: int
+
+
+class OutboxIdsBody(BaseModel):
+    """Select specific outbox ids, or all rows matching status."""
+
+    ids: list[int] = Field(default_factory=list)
+    all: bool = False
+    status: str = "dead"
+
+
+class OutboxActionOut(BaseModel):
+    affected: int
+    action: str
 
 
 def _page_meta(page, page_size, total) -> PageMeta:
@@ -469,6 +528,80 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Widget not found")
         return {"deleted": True}
 
+    @app.get("/api/outbox/summary", response_model=OutboxSummaryOut)
+    def outbox_summary() -> OutboxSummaryOut:
+        """Outbox status counts for ops (alert on ``dead``)."""
+        counts = repo.outbox_status_counts()
+        return OutboxSummaryOut(
+            counts=counts,
+            open=repo.count_outbox_open(),
+            dead=int(counts.get("dead") or 0),
+        )
+
+    @app.get("/api/outbox", response_model=OutboxPageOut)
+    def list_outbox(
+        status: str | None = Query(
+            "dead",
+            description="Filter by status; default dead. Use 'all' for every status.",
+        ),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ) -> OutboxPageOut:
+        """List dispatch_outbox rows (default: dead-letter queue)."""
+        st = None if not status or status.lower() in ("all", "*") else status
+        total = repo.count_outbox(st)
+        offset = (page - 1) * page_size
+        rows = repo.list_outbox(status=st, limit=page_size, offset=offset)
+        meta = _page_meta(page, page_size, total)
+        items = [
+            OutboxRowOut(
+                id=r.id,
+                idempotency_key=r.idempotency_key,
+                alert_id=r.alert_id,
+                channel=r.channel,
+                status=r.status,
+                attempts=r.attempts,
+                next_attempt_at=r.next_attempt_at,
+                last_error=r.last_error,
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+            )
+            for r in rows
+        ]
+        return OutboxPageOut(
+            items=items,
+            page=meta.page,
+            page_size=meta.page_size,
+            total=meta.total,
+            pages=meta.pages,
+            has_next=meta.has_next,
+            has_prev=meta.has_prev,
+        )
+
+    @app.post("/api/outbox/redrive", response_model=OutboxActionOut)
+    def redrive_outbox(body: OutboxIdsBody) -> OutboxActionOut:
+        """Reset dead/failed outbox rows to pending for another worker attempt."""
+        if body.all:
+            n = repo.redrive_outbox(status=body.status or "dead", all_matching=True)
+        else:
+            if not body.ids:
+                raise HTTPException(status_code=400, detail="Provide ids or set all=true")
+            n = repo.redrive_outbox(ids=body.ids, all_matching=False)
+        logger.info("Outbox redrive affected=%s all=%s status=%s", n, body.all, body.status)
+        return OutboxActionOut(affected=n, action="redrive")
+
+    @app.post("/api/outbox/clear", response_model=OutboxActionOut)
+    def clear_outbox(body: OutboxIdsBody) -> OutboxActionOut:
+        """Permanently delete outbox rows (default scope: dead)."""
+        if body.all:
+            n = repo.delete_outbox(status=body.status or "dead", all_matching=True)
+        else:
+            if not body.ids:
+                raise HTTPException(status_code=400, detail="Provide ids or set all=true")
+            n = repo.delete_outbox(ids=body.ids, all_matching=False)
+        logger.info("Outbox clear affected=%s all=%s status=%s", n, body.all, body.status)
+        return OutboxActionOut(affected=n, action="clear")
+
     @app.get("/api/dispatches/recent", response_model=DispatchPageOut)
     def recent_dispatches(
         page: int = Query(1, ge=1),
@@ -499,6 +632,104 @@ def create_app() -> FastAPI:
         _touch_cache()
         logger.info("Demo reset: %s", result)
         return DemoResetOut(**result)
+
+    @app.post("/api/demo/seed-dead-outbox", response_model=DemoSeedDeadOut)
+    def demo_seed_dead_outbox(body: DemoSeedDeadBody | None = None) -> DemoSeedDeadOut:
+        """Create dead outbox rows for operator UI demos (no real HTTP required).
+
+        1. Inserts ``count`` synthetic incidents + outbox rows already marked ``dead``.
+        2. Optionally marks existing pending/failed outbox rows as ``dead`` too.
+        """
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        from sqlalchemy import select, update
+
+        from alert_pipeline.db.models import DispatchOutbox
+        from alert_pipeline.schemas import AlertEvent, AlertStatus, LogLevel
+
+        if not _rate_limit_ok(_demo_fire_hits, limit=settings.demo_rate_limit_per_minute):
+            raise HTTPException(status_code=429, detail="Demo rate limit exceeded")
+
+        body = body or DemoSeedDeadBody()
+        channel = (body.channel or "webhook").strip() or "webhook"
+        now = datetime.now(timezone.utc)
+        created_ids: list[int] = []
+
+        for i in range(body.count):
+            aid = str(uuid4())
+            alert = AlertEvent(
+                id=aid,
+                fingerprint=f"demo-dead-{aid[:8]}",
+                title=f"[demo] dead outbox sample #{i + 1}",
+                description="Synthetic dead notification for UI demo",
+                severity=LogLevel.ERROR,
+                service="demo-dead-outbox",
+                host="ui-demo",
+                status=AlertStatus.OPEN,
+                occurrence_count=1,
+                first_seen=now,
+                last_seen=now,
+                sample_message="demo: max attempts exhausted",
+                error_code="DEMO_DEAD",
+                labels={"source": "ui-demo", "purpose": "dead-outbox"},
+                is_new=True,
+            )
+            repo.upsert_alert(alert)
+            keys = repo.enqueue_dispatch(alert, [channel])
+            if not keys:
+                # Rare: same key already present — bump occurrence for unique key
+                alert.occurrence_count = i + 100
+                keys = repo.enqueue_dispatch(alert, [channel])
+            with repo.session() as session:
+                row = session.scalar(
+                    select(DispatchOutbox).where(
+                        DispatchOutbox.idempotency_key
+                        == repo.make_idempotency_key(alert.id, channel, alert.occurrence_count)
+                    )
+                )
+                if row is not None:
+                    row.status = "dead"
+                    row.attempts = max(1, settings.dispatch_outbox_max_attempts)
+                    row.last_error = (
+                        f"demo: simulated channel failure after max attempts (channel={channel})"
+                    )
+                    row.updated_at = now
+                    created_ids.append(row.id)
+
+        marked_open = 0
+        if body.mark_open_as_dead:
+            with repo.session() as session:
+                result = session.execute(
+                    update(DispatchOutbox)
+                    .where(DispatchOutbox.status.in_(("pending", "failed", "processing")))
+                    .values(
+                        status="dead",
+                        last_error="demo: marked open outbox as dead for UI exercise",
+                        updated_at=now,
+                    )
+                )
+                marked_open = int(result.rowcount or 0)
+
+        dead_total = repo.count_outbox("dead")
+        _touch_cache()
+        logger.info(
+            "Demo seed-dead-outbox created=%s marked_open=%s dead_total=%s",
+            len(created_ids),
+            marked_open,
+            dead_total,
+        )
+        return DemoSeedDeadOut(
+            created=len(created_ids),
+            marked_open=marked_open,
+            dead_total=dead_total,
+            outbox_ids=created_ids,
+            note=(
+                f"Created {len(created_ids)} synthetic dead row(s)"
+                + (f"; marked {marked_open} open row(s) dead" if marked_open else "")
+                + f". Total dead now: {dead_total}. Use Redrive/Clear in the panel below."
+            ),
+        )
 
     @app.post("/api/demo/fire", response_model=DemoFireOut)
     def demo_fire(body: DemoFireBody) -> DemoFireOut:
@@ -644,4 +875,8 @@ def main() -> None:
     )
 
 
-app = create_app()
+def __getattr__(name: str):
+    """Lazy ASGI app for ``uvicorn alert_pipeline.ui.app:app`` without import-time DB connect."""
+    if name == "app":
+        return create_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

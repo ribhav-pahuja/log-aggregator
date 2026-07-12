@@ -265,6 +265,18 @@ body {
   border-color: #f31260;
 }
 
+.outbox-panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.15rem 1.15rem;
+  margin-bottom: 1.25rem;
+}
+.outbox-panel .table-wrap { margin-top: 0.75rem; overflow-x: auto; }
+.outbox-panel .mono { font-family: var(--mono); font-size: 0.85rem; }
+.outbox-panel .row-actions { white-space: nowrap; display: flex; gap: 0.35rem; }
+.btn-sm { padding: 0.2rem 0.5rem; font-size: 0.8rem; }
+
 .demo-panel {
   background: var(--bg-elev);
   border: 1px solid var(--border);
