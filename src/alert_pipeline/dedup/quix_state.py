@@ -86,9 +86,7 @@ def process_enriched_with_state(
     existing: dict[str, Any] | None = raw if isinstance(raw, dict) else None
 
     # Drop expired blob before transition so Quix state stays clean
-    if existing is not None and window_expired(
-        existing, event_ts=event_ts, window_seconds=window
-    ):
+    if existing is not None and window_expired(existing, event_ts=event_ts, window_seconds=window):
         try:
             state.delete(_STATE_KEY)
         except Exception:  # noqa: BLE001
@@ -122,17 +120,13 @@ def process_enriched_with_state(
             window,
         )
         return {
-            "alert": alert_wire_from_state(
-                result.state, is_new=True, description=event.message
-            ),
+            "alert": alert_wire_from_state(result.state, is_new=True, description=event.message),
             "suppress_dispatch_while_acknowledged": suppress_ack,
             "allow_reopen_after_resolve": allow_reopen,
         }
 
     return {
-        "alert": alert_wire_from_state(
-            result.state, is_new=False, description=event.message
-        ),
+        "alert": alert_wire_from_state(result.state, is_new=False, description=event.message),
         "suppress_dispatch_while_acknowledged": suppress_ack,
         "allow_reopen_after_resolve": allow_reopen,
     }

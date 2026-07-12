@@ -85,9 +85,7 @@ class DedupEngine:
         incident = IncidentState(**fields)
 
         if result.action == "new":
-            created = self._store.try_create(
-                incident, ttl_seconds=cfg.dedup_window_seconds
-            )
+            created = self._store.try_create(incident, ttl_seconds=cfg.dedup_window_seconds)
             if not created:
                 # Race with another thread — re-apply against the winner's state
                 winner = self._store.get(fingerprint)
@@ -106,9 +104,7 @@ class DedupEngine:
                 self._store.put(incident, ttl_seconds=cfg.dedup_window_seconds)
                 if result.action == "suppress":
                     return None
-                return alert_event_from_state(
-                    result.state, is_new=False, description=event.message
-                )
+                return alert_event_from_state(result.state, is_new=False, description=event.message)
 
             logger.info(
                 "New incident fingerprint=%s service=%s window=%ss refire=%ss",
@@ -117,9 +113,7 @@ class DedupEngine:
                 cfg.dedup_window_seconds,
                 cfg.refire_interval_seconds,
             )
-            return alert_event_from_state(
-                result.state, is_new=True, description=event.message
-            )
+            return alert_event_from_state(result.state, is_new=True, description=event.message)
 
         self._store.put(incident, ttl_seconds=cfg.dedup_window_seconds)
         if result.action == "suppress":
@@ -131,9 +125,7 @@ class DedupEngine:
             )
             return None
 
-        return alert_event_from_state(
-            result.state, is_new=False, description=event.message
-        )
+        return alert_event_from_state(result.state, is_new=False, description=event.message)
 
     def stats(self) -> dict[str, int]:
         return {"open_incidents": self._store.count()}
