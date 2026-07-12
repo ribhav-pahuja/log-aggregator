@@ -18,7 +18,12 @@ from alert_pipeline.config import Settings, get_settings
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.engine import DedupEngine
 from alert_pipeline.dedup.store import MemoryDedupStore, build_dedup_store
-from alert_pipeline.dispatchers.registry import DispatchFanout, build_dispatchers
+from alert_pipeline.dispatchers.registry import (
+    DispatchFanout,
+    build_dispatchers,
+    enabled_channel_names,
+)
+from alert_pipeline.observability import ALERTS_EMITTED, ALERTS_SKIPPED, OUTBOX_ENQUEUED
 from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, LogEvent, LogLevel
 from alert_pipeline.ui_cache_invalidate import invalidate_ui_snapshot
 
@@ -156,9 +161,7 @@ class AlertProcessor:
             )
         raw = parse_log_payload(payload)
         if raw is None:
-            return ProcessResult(
-                emitted=False, skipped_reason="unparseable", raw_for_dlq=payload
-            )
+            return ProcessResult(emitted=False, skipped_reason="unparseable", raw_for_dlq=payload)
         return self.handle_event(LogEvent.from_kafka_value(raw))
 
     def handle_event(self, event: LogEvent) -> ProcessResult:
@@ -176,17 +179,48 @@ class AlertProcessor:
         if alert is None:
             return ProcessResult(emitted=False, skipped_reason="dedup_suppressed")
 
-        return self.emit_alert(alert, suppress_while_acked=cfg.suppress_dispatch_while_acknowledged)
+        return self.emit_alert(
+            alert,
+            suppress_while_acked=cfg.suppress_dispatch_while_acknowledged,
+            allow_reopen_after_resolve=cfg.allow_reopen_after_resolve,
+        )
 
     def emit_alert(
-        self, alert: AlertEvent, *, suppress_while_acked: bool = True
+        self,
+        alert: AlertEvent,
+        *,
+        suppress_while_acked: bool = True,
+        allow_reopen_after_resolve: bool = True,
     ) -> ProcessResult:
-        """Persist incident and fan-out notifications (dedup already decided)."""
-        return self._persist_and_maybe_dispatch(alert, suppress_while_acked)
+        """Persist incident and enqueue/send notifications (dedup already decided)."""
+        return self._persist_and_maybe_dispatch(
+            alert,
+            suppress_while_acked,
+            allow_reopen_after_resolve=allow_reopen_after_resolve,
+        )
 
     def _persist_and_maybe_dispatch(
-        self, alert: AlertEvent, suppress_while_acked: bool
+        self,
+        alert: AlertEvent,
+        suppress_while_acked: bool,
+        *,
+        allow_reopen_after_resolve: bool = True,
     ) -> ProcessResult:
+        # Policy: after resolve, late activity may open a new incident only if allowed.
+        if not allow_reopen_after_resolve:
+            if not self.repo.has_active_fingerprint(alert.fingerprint):
+                if self.repo.has_resolved_fingerprint(alert.fingerprint):
+                    ALERTS_SKIPPED.labels(reason="reopen_disallowed").inc()
+                    logger.info(
+                        "Skip emit fingerprint=%s — resolved and allow_reopen_after_resolve=false",
+                        alert.fingerprint,
+                    )
+                    return ProcessResult(
+                        emitted=False,
+                        fingerprint=alert.fingerprint,
+                        skipped_reason="reopen_disallowed",
+                    )
+
         record = self.repo.upsert_alert(alert)
         # Redis: UI snapshot only
         if self.settings.ui_cache_invalidate_on_write:
@@ -196,19 +230,16 @@ class AlertProcessor:
             )
 
         dispatch_suppressed = False
-        if (
-            not alert.is_new
-            and suppress_while_acked
-            and record.status == "acknowledged"
-        ):
+        if not alert.is_new and suppress_while_acked and record.status == "acknowledged":
             dispatch_suppressed = True
             logger.info(
                 "Skip dispatch for acked incident %s (refire suppressed by YAML)",
                 alert.id,
             )
         else:
-            self.fanout.dispatch(alert)
+            self._dispatch_or_enqueue(alert)
 
+        ALERTS_EMITTED.labels(is_new="true" if alert.is_new else "false").inc()
         return ProcessResult(
             emitted=True,
             alert_id=alert.id,
@@ -219,3 +250,30 @@ class AlertProcessor:
             severity=alert.severity.value,
             dispatch_suppressed=dispatch_suppressed,
         )
+
+    def _dispatch_or_enqueue(self, alert: AlertEvent) -> None:
+        """Outbox (default) or inline fan-out depending on DISPATCH_MODE."""
+        if not self.settings.dispatch_enabled:
+            return
+        channels = enabled_channel_names(self.settings)
+        if not channels:
+            return
+
+        mode = (self.settings.dispatch_mode or "outbox").lower()
+        if mode == "inline":
+            self.fanout.dispatch(alert)
+            return
+
+        keys = self.repo.enqueue_dispatch(alert, channels)
+        for key in keys:
+            # key format: alert_id:channel:count
+            parts = key.split(":")
+            channel = parts[1] if len(parts) >= 2 else "unknown"
+            OUTBOX_ENQUEUED.labels(channel=channel).inc()
+        if keys:
+            logger.info(
+                "Enqueued %s outbox row(s) for alert %s (occurrence=%s)",
+                len(keys),
+                alert.id,
+                alert.occurrence_count,
+            )

@@ -1,12 +1,29 @@
 # Alert pipeline behaviour — refiring, dedup windows, thresholds, fingerprint fields.
 # Override path with ALERT_CONFIG_PATH (default: config/alerts.yaml or /config/alerts.yaml in Docker).
 #
+# ============================================================================
+# Fingerprint field selection (primary knobs for cardinality)
+# ============================================================================
 # dedup_fields — which LogEvent attributes form the dedup fingerprint.
 # Supported values:
 #   service, level (or severity), message, labels, error_code, host, trace_id
 #   label:<name>   e.g. label:env   (single label key; also accepts labels.env)
 #
-# Only fields listed participate. Change message/labels (if included) → new incident group.
+# Only fields listed participate. Defaults + per-service + per-error_code layers merge
+# (error_code wins over service wins over defaults for keys present in the layer).
+#
+# Tips to control cardinality:
+#   - Prefer error_code + service when codes are stable (exclude free-text message).
+#   - Use label:env not full labels if label sets are noisy (request ids, pod names).
+#   - Include host only when you need per-node incidents (default excludes host).
+#   - Avoid trace_id in fingerprints unless you intentionally want one incident per request.
+#
+# Message text (when included) is normalized in code: UUIDs, long hex, ISO timestamps,
+# and request/trace id key=value tokens are stripped. Custom regex is not supported —
+# control grouping by choosing fields, not by writing patterns.
+#
+# Windows / refire use **event time** (log timestamp), not consumer wall-clock.
+# allow_reopen_after_resolve: if false, late logs after resolve do not open a new incident.
 
 version: 1
 

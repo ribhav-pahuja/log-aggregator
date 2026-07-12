@@ -246,9 +246,7 @@ class _Snapshot:
     def to_jsonable(self) -> dict[str, Any]:
         return {
             "alerts": {k: v.to_jsonable() for k, v in self.alerts.items()},
-            "dispatches": {
-                k: [d.to_jsonable() for d in v] for k, v in self.dispatches.items()
-            },
+            "dispatches": {k: [d.to_jsonable() for d in v] for k, v in self.dispatches.items()},
             "recent_dispatches": [d.to_jsonable() for d in self.recent_dispatches],
             "services": self.services,
             "stats": self.stats.to_jsonable(),
@@ -259,16 +257,12 @@ class _Snapshot:
 
     @classmethod
     def from_jsonable(cls, data: dict[str, Any]) -> "_Snapshot":
-        alerts = {
-            k: CachedAlert.from_jsonable(v) for k, v in (data.get("alerts") or {}).items()
-        }
+        alerts = {k: CachedAlert.from_jsonable(v) for k, v in (data.get("alerts") or {}).items()}
         dispatches = {
             k: [CachedDispatch.from_jsonable(x) for x in v]
             for k, v in (data.get("dispatches") or {}).items()
         }
-        recent = [
-            CachedDispatch.from_jsonable(x) for x in (data.get("recent_dispatches") or [])
-        ]
+        recent = [CachedDispatch.from_jsonable(x) for x in (data.get("recent_dispatches") or [])]
         return cls(
             alerts=alerts,
             dispatches=dispatches,
@@ -492,9 +486,7 @@ class AlertReadCache:
         )
         with self._session_factory() as session:
             rows = session.scalars(
-                select(AlertRecord)
-                .order_by(desc(AlertRecord.last_seen))
-                .limit(self.max_alerts)
+                select(AlertRecord).order_by(desc(AlertRecord.last_seen)).limit(self.max_alerts)
             ).all()
             ids = [r.id for r in rows]
             ok_map: dict[str, int] = {}
@@ -515,9 +507,7 @@ class AlertReadCache:
                         fail_map[alert_id] = int(cnt)
 
             for r in rows:
-                snap.alerts[r.id] = _row_to_cached(
-                    r, ok_map.get(r.id, 0), fail_map.get(r.id, 0)
-                )
+                snap.alerts[r.id] = _row_to_cached(r, ok_map.get(r.id, 0), fail_map.get(r.id, 0))
 
             if ids:
                 drows = session.scalars(
@@ -808,9 +798,7 @@ class AlertReadCache:
         slice_ = items[start : start + page_size]
         return Page(items=slice_, total=total, page=page, page_size=page_size)
 
-    def alert_dispatches_page(
-        self, alert_id: str, *, page: int = 1, page_size: int = 50
-    ) -> Page:
+    def alert_dispatches_page(self, alert_id: str, *, page: int = 1, page_size: int = 50) -> Page:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         snap = self._ensure_fresh()

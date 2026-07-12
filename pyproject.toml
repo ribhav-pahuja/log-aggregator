@@ -20,6 +20,7 @@ dependencies = [
     "pyyaml>=6.0.2,<7",
     "redis>=5.2.0,<6",
     "alembic>=1.14.0,<2",
+    "prometheus-client>=0.21.0,<1",
 ]
 
 [project.optional-dependencies]
@@ -44,8 +45,18 @@ dev = [
 
 [project.scripts]
 alert-pipeline = "alert_pipeline.main:main"
+alert-dispatch-worker = "alert_pipeline.dispatchers.outbox_worker:main"
 log-producer = "alert_pipeline.sample_producer:main"
 alert-ui = "alert_pipeline.ui.app:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+# Long lines in docs/tests; keep F/E9 as hard errors via CI if needed
+ignore = ["E501"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

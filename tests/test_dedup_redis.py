@@ -29,9 +29,7 @@ def _err(msg: str = "redis backend boom") -> LogEvent:
 
 
 def test_redis_dedup_emits_then_suppresses(redis_store):
-    engine = DedupEngine(
-        window_seconds=300, update_interval_seconds=60, store=redis_store
-    )
+    engine = DedupEngine(window_seconds=300, update_interval_seconds=60, store=redis_store)
     first = engine.process(_err())
     second = engine.process(_err())
     assert first is not None and first.is_new is True

@@ -65,8 +65,40 @@ class DispatchLog(Base):
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_body: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Matches outbox idempotency when present (reprocessing-safe audit).
+    idempotency_key: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class DispatchOutbox(Base):
+    """Async notification work queue — filled on the emit path, drained by a worker.
+
+    Keeps Zenduty/Teams/webhook HTTP off the Quix consume/sink hot path.
+    """
+
+    __tablename__ = "dispatch_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # {alert_id}:{channel}:{occurrence_count} — unique so re-emit is a no-op
+    idempotency_key: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    alert_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Full AlertEvent JSON for the dispatcher
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # pending | processing | sent | failed | dead
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
 
@@ -87,4 +119,3 @@ class WidgetRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
-

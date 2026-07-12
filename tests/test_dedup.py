@@ -25,6 +25,14 @@ def test_fingerprint_stable_across_hosts_same_message_and_labels():
     assert compute_fingerprint(a) == compute_fingerprint(b)
 
 
+def test_fingerprint_normalizes_uuid_ts_and_request_id():
+    a = _err("fail req_id=abc-123 at 2026-01-01T12:00:00Z id=550e8400-e29b-41d4-a716-446655440000")
+    b = _err(
+        "fail req_id=other at 2026-06-15T08:30:00+00:00 id=11111111-2222-3333-4444-555555555555"
+    )
+    assert compute_fingerprint(a) == compute_fingerprint(b)
+
+
 def test_fingerprint_differs_by_message():
     a = _err("connection refused while calling postgres")
     b = _err("payment gateway timeout after 30s")
@@ -77,9 +85,7 @@ def test_different_message_opens_new_incident():
 
 def test_dedup_emits_update_after_interval(monkeypatch):
     store = MemoryDedupStore()
-    engine = DedupEngine(
-        window_seconds=300, update_interval_seconds=1, store=store
-    )
+    engine = DedupEngine(window_seconds=300, update_interval_seconds=1, store=store)
     first = engine.process(_err())
     assert first is not None
 

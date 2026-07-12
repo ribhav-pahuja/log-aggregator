@@ -25,7 +25,6 @@ def invalidate_ui_snapshot(
         import redis
 
         client = redis.Redis.from_url(redis_url, decode_responses=True)
-        key = f"{key_prefix}:{_SNAPSHOT_SUFFIX}" if ":" not in key_prefix[-1:] else f"{key_prefix}{_SNAPSHOT_SUFFIX}"
         # alert_cache uses f-string alert_ui:snapshot via constants — keep compatible
         keys = [
             f"{key_prefix.rstrip(':')}:snapshot",

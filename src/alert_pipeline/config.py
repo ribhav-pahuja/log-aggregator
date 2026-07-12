@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
 
     dispatch_enabled: bool = True
+    # outbox = enqueue on emit path + separate worker (default, production)
+    # inline = sync fan-out on emit (tests / single-process demos)
+    dispatch_mode: Literal["outbox", "inline"] = "outbox"
+    dispatch_outbox_poll_seconds: float = Field(default=1.0, ge=0.1)
+    dispatch_outbox_batch_size: int = Field(default=50, ge=1, le=500)
+    dispatch_outbox_max_attempts: int = Field(default=8, ge=1)
+    dispatch_outbox_stale_processing_seconds: int = Field(default=120, ge=10)
+
     dispatch_zenduty_enabled: bool = False
     zenduty_integration_key: str = ""
     zenduty_api_url: str = "https://www.zenduty.com/api/events"
@@ -50,6 +58,9 @@ class Settings(BaseSettings):
     dispatch_webhook_enabled: bool = False
     webhook_url: str = ""
     webhook_headers_json: str = "{}"
+
+    # Demo API rate limits (per process, sliding window)
+    demo_rate_limit_per_minute: int = Field(default=30, ge=1)
 
     # UI read cache only (not pipeline dedup)
     redis_url: str = "redis://localhost:6379/0"
@@ -68,9 +79,7 @@ class Settings(BaseSettings):
             return "quix"
         name = str(v).strip().lower()
         if name in ("flink", "pyflink"):
-            raise ValueError(
-                "PIPELINE_RUNTIME=flink is no longer supported. Use quix (default)."
-            )
+            raise ValueError("PIPELINE_RUNTIME=flink is no longer supported. Use quix (default).")
         if name in ("quixstreams",):
             return "quixstreams"
         return name

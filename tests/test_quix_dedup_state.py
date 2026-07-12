@@ -80,9 +80,7 @@ def test_window_expiry_opens_new_incident():
     inc = st.get("incident")
     from datetime import datetime, timezone
 
-    inc["last_seen"] = datetime.fromtimestamp(
-        1_700_000_000.0 - 100, tz=timezone.utc
-    ).isoformat()
+    inc["last_seen"] = datetime.fromtimestamp(1_700_000_000.0 - 100, tz=timezone.utc).isoformat()
     inc["window_seconds"] = 10
     st.set("incident", inc)
     again = process_enriched_with_state(row, st, now=1_700_000_100.0)

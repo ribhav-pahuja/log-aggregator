@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 class ZendutyDispatcher(AlertDispatcher):
     name = "zenduty"
 
-    def __init__(self, integration_key: str, api_url: str = "https://www.zenduty.com/api/events") -> None:
+    def __init__(
+        self, integration_key: str, api_url: str = "https://www.zenduty.com/api/events"
+    ) -> None:
         if not integration_key:
             raise ValueError("zenduty_integration_key is required when Zenduty is enabled")
         self.integration_key = integration_key
@@ -55,7 +57,11 @@ class ZendutyDispatcher(AlertDispatcher):
             },
         }
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=8), reraise=True)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+        reraise=True,
+    )
     def _post(self, body: dict) -> httpx.Response:
         url = f"{self.api_url}/{self.integration_key}/"
         with httpx.Client(timeout=15.0) as client:

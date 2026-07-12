@@ -4,22 +4,29 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
-from sqlalchemy import create_engine, delete, select, text
-import uuid
+from sqlalchemy import create_engine, delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from alert_pipeline.db.models import AlertRecord, Base, DispatchLog, WidgetRecord
+from alert_pipeline.db.models import (
+    AlertRecord,
+    Base,
+    DispatchLog,
+    DispatchOutbox,
+    WidgetRecord,
+)
 from alert_pipeline.metrics import apply_status_timestamps
 from alert_pipeline.schemas import ACTIVE_ALERT_STATUSES, AlertEvent
 
 logger = logging.getLogger(__name__)
 
 _ACTIVE = tuple(ACTIVE_ALERT_STATUSES)
+_OUTBOX_OPEN = ("pending", "processing", "failed")
 
 # Partial unique index: at most one active incident per fingerprint.
 # Status list must match ACTIVE_ALERT_STATUSES.
@@ -85,11 +92,30 @@ class AlertRepository:
             return self._upsert_once(alert)
         except IntegrityError:
             # Concurrent insert of same active fingerprint — retry as update
-            logger.info(
-                "Active fingerprint race for %s; retrying as update", alert.fingerprint
-            )
+            logger.info("Active fingerprint race for %s; retrying as update", alert.fingerprint)
             alert.is_new = False
             return self._upsert_once(alert)
+
+    def has_active_fingerprint(self, fingerprint: str) -> bool:
+        with self.session() as session:
+            row = session.scalar(
+                select(AlertRecord.id).where(
+                    AlertRecord.fingerprint == fingerprint,
+                    AlertRecord.status.in_(_ACTIVE),
+                )
+            )
+            return row is not None
+
+    def has_resolved_fingerprint(self, fingerprint: str) -> bool:
+        """True if a resolved row exists (regardless of active)."""
+        with self.session() as session:
+            row = session.scalar(
+                select(AlertRecord.id).where(
+                    AlertRecord.fingerprint == fingerprint,
+                    AlertRecord.status == "resolved",
+                )
+            )
+            return row is not None
 
     def _upsert_once(self, alert: AlertEvent) -> AlertRecord:
         with self.session() as session:
@@ -100,6 +126,11 @@ class AlertRepository:
                 )
             )
             if existing is None:
+                # Reopen after resolve may reuse Quix state's alert_id; PK would collide.
+                by_id = session.get(AlertRecord, alert.id)
+                if by_id is not None:
+                    alert.id = str(uuid.uuid4())
+                    alert.is_new = True
                 record = AlertRecord(
                     id=alert.id,
                     fingerprint=alert.fingerprint,
@@ -175,11 +206,13 @@ class AlertRepository:
                 apply_status_timestamps(row, "resolved", now=now)
 
     def clear_all(self) -> dict[str, int]:
-        """Wipe alerts + dispatch audit (demo / empty slate)."""
+        """Wipe alerts + dispatch audit + outbox (demo / empty slate)."""
         with self.session() as session:
+            d0 = session.execute(delete(DispatchOutbox))
             d1 = session.execute(delete(DispatchLog))
             d2 = session.execute(delete(AlertRecord))
             return {
+                "outbox_deleted": int(d0.rowcount or 0),
                 "dispatch_log_deleted": int(d1.rowcount or 0),
                 "alerts_deleted": int(d2.rowcount or 0),
             }
@@ -193,6 +226,7 @@ class AlertRepository:
         status_code: int | None = None,
         response_body: str | None = None,
         error_message: str | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         with self.session() as session:
             session.add(
@@ -203,8 +237,156 @@ class AlertRepository:
                     status_code=status_code,
                     response_body=(response_body or "")[:4000] or None,
                     error_message=(error_message or "")[:2000] or None,
+                    idempotency_key=idempotency_key,
                 )
             )
+
+    # --- dispatch outbox --------------------------------------------------------
+
+    @staticmethod
+    def make_idempotency_key(alert_id: str, channel: str, occurrence_count: int) -> str:
+        return f"{alert_id}:{channel}:{int(occurrence_count)}"
+
+    def enqueue_dispatch(
+        self,
+        alert: AlertEvent,
+        channels: list[str],
+    ) -> list[str]:
+        """Insert pending outbox rows (one per channel). Returns new idempotency keys.
+
+        Duplicate keys (reprocessing) are ignored via unique constraint.
+        """
+        if not channels:
+            return []
+        payload = json.dumps(alert.model_dump(mode="json"))
+        now = datetime.now(timezone.utc)
+        created: list[str] = []
+        with self.session() as session:
+            for channel in channels:
+                key = self.make_idempotency_key(alert.id, channel, alert.occurrence_count)
+                exists = session.scalar(
+                    select(DispatchOutbox.id).where(DispatchOutbox.idempotency_key == key)
+                )
+                if exists is not None:
+                    continue
+                session.add(
+                    DispatchOutbox(
+                        idempotency_key=key,
+                        alert_id=alert.id,
+                        channel=channel,
+                        payload_json=payload,
+                        status="pending",
+                        attempts=0,
+                        next_attempt_at=now,
+                    )
+                )
+                created.append(key)
+            session.flush()
+        return created
+
+    def claim_outbox_batch(
+        self,
+        *,
+        batch_size: int = 50,
+        stale_processing_seconds: int = 120,
+    ) -> list[DispatchOutbox]:
+        """Mark a batch of due rows as processing and return them."""
+        now = datetime.now(timezone.utc)
+        stale_before = now - timedelta(seconds=stale_processing_seconds)
+        with self.session() as session:
+            # Recover stale processing rows
+            session.execute(
+                update(DispatchOutbox)
+                .where(
+                    DispatchOutbox.status == "processing",
+                    DispatchOutbox.updated_at < stale_before,
+                )
+                .values(status="pending", next_attempt_at=now)
+            )
+            rows = list(
+                session.scalars(
+                    select(DispatchOutbox)
+                    .where(
+                        DispatchOutbox.status.in_(("pending", "failed")),
+                        DispatchOutbox.next_attempt_at <= now,
+                    )
+                    .order_by(DispatchOutbox.next_attempt_at, DispatchOutbox.id)
+                    .limit(batch_size)
+                ).all()
+            )
+            out: list[DispatchOutbox] = []
+            for row in rows:
+                row.status = "processing"
+                row.attempts = int(row.attempts or 0) + 1
+                row.updated_at = now
+                session.flush()
+                session.expunge(row)
+                out.append(row)
+            return out
+
+    def mark_outbox_sent(self, outbox_id: int) -> None:
+        now = datetime.now(timezone.utc)
+        with self.session() as session:
+            row = session.get(DispatchOutbox, outbox_id)
+            if row is None:
+                return
+            row.status = "sent"
+            row.last_error = None
+            row.updated_at = now
+
+    def mark_outbox_result(
+        self,
+        outbox_id: int,
+        *,
+        success: bool,
+        error: str | None,
+        max_attempts: int,
+        backoff_base_seconds: float = 2.0,
+    ) -> str:
+        """Return final status: sent | failed | dead."""
+        now = datetime.now(timezone.utc)
+        with self.session() as session:
+            row = session.get(DispatchOutbox, outbox_id)
+            if row is None:
+                return "missing"
+            if success:
+                row.status = "sent"
+                row.last_error = None
+                row.updated_at = now
+                return "sent"
+            attempts = int(row.attempts or 0)
+            row.last_error = (error or "")[:2000] or None
+            if attempts >= max_attempts:
+                row.status = "dead"
+                row.updated_at = now
+                return "dead"
+            # Exponential backoff: base^attempts seconds (capped)
+            delay = min(300.0, backoff_base_seconds ** max(1, attempts))
+            row.status = "failed"
+            row.next_attempt_at = now + timedelta(seconds=delay)
+            row.updated_at = now
+            return "failed"
+
+    def dispatch_idempotency_succeeded(self, idempotency_key: str) -> bool:
+        with self.session() as session:
+            row = session.scalar(
+                select(DispatchLog.id).where(
+                    DispatchLog.idempotency_key == idempotency_key,
+                    DispatchLog.success == 1,
+                )
+            )
+            return row is not None
+
+    def count_outbox_open(self) -> int:
+        with self.session() as session:
+            from sqlalchemy import func
+
+            n = session.scalar(
+                select(func.count())
+                .select_from(DispatchOutbox)
+                .where(DispatchOutbox.status.in_(_OUTBOX_OPEN))
+            )
+            return int(n or 0)
 
     # --- shared dashboard widgets -------------------------------------------------
 

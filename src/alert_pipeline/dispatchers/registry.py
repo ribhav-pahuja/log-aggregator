@@ -41,34 +41,70 @@ def build_dispatchers(settings: Settings) -> list[AlertDispatcher]:
     return dispatchers
 
 
+def enabled_channel_names(settings: Settings) -> list[str]:
+    """Channel names that would receive a dispatch for the current config."""
+    return [d.name for d in build_dispatchers(settings)]
+
+
 class DispatchFanout:
     """Send each alert to every configured channel and audit the results."""
 
-    def __init__(self, dispatchers: list[AlertDispatcher], repo: AlertRepository | None = None) -> None:
+    def __init__(
+        self, dispatchers: list[AlertDispatcher], repo: AlertRepository | None = None
+    ) -> None:
         self.dispatchers = dispatchers
         self.repo = repo
+        self._by_name = {d.name: d for d in dispatchers}
 
-    def dispatch(self, alert: AlertEvent) -> list[DispatchResult]:
+    def dispatch(
+        self,
+        alert: AlertEvent,
+        *,
+        idempotency_key: str | None = None,
+    ) -> list[DispatchResult]:
         results: list[DispatchResult] = []
         for dispatcher in self.dispatchers:
-            result = dispatcher.send(alert)
-            results.append(result)
-            if self.repo is not None:
-                self.repo.log_dispatch(
-                    alert_id=alert.id,
-                    channel=result.channel,
-                    success=result.success,
-                    status_code=result.status_code,
-                    response_body=result.response_body,
-                    error_message=result.error_message,
+            key = idempotency_key
+            if key is None and self.repo is not None:
+                key = self.repo.make_idempotency_key(
+                    alert.id, dispatcher.name, alert.occurrence_count
                 )
-            if result.success:
-                logger.info("Dispatched alert %s via %s", alert.id, result.channel)
-            else:
-                logger.error(
-                    "Failed dispatch alert %s via %s: %s",
-                    alert.id,
-                    result.channel,
-                    result.error_message or result.response_body,
-                )
+            results.append(self.dispatch_one(alert, channel=dispatcher.name, idempotency_key=key))
         return results
+
+    def dispatch_one(
+        self,
+        alert: AlertEvent,
+        *,
+        channel: str,
+        idempotency_key: str | None = None,
+    ) -> DispatchResult:
+        dispatcher = self._by_name.get(channel)
+        if dispatcher is None:
+            result = DispatchResult(
+                channel=channel,
+                success=False,
+                error_message=f"unknown channel {channel!r}",
+            )
+        else:
+            result = dispatcher.send(alert)
+        if self.repo is not None:
+            self.repo.log_dispatch(
+                alert_id=alert.id,
+                channel=result.channel,
+                success=result.success,
+                status_code=result.status_code,
+                response_body=result.response_body,
+                error_message=result.error_message,
+                idempotency_key=idempotency_key,
+            )
+        if result.success:
+            logger.info("Dispatched alert %s via %s", alert.id, result.channel)
+        else:
+            logger.error(
+                "Failed dispatch alert %s via %s: %s",
+                alert.id,
+                result.channel,
+                result.error_message or result.response_body,
+            )
+        return result

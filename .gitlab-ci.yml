@@ -1,0 +1,76 @@
+# GitLab CI — mirrors GitHub Actions: lint, test, migrate, image builds.
+
+stages:
+  - lint
+  - test
+  - migrate
+  - build
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHON_VERSION: "3.12"
+
+.python:
+  image: python:3.12-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libpq-dev
+    - pip install -U pip
+    - pip install -e ".[dev]"
+
+lint:
+  extends: .python
+  stage: lint
+  script:
+    - ruff check src tests
+    - ruff format --check src tests
+
+test:
+  extends: .python
+  stage: test
+  script:
+    - pytest -q
+
+migrate:
+  image: python:3.12-slim
+  stage: migrate
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: alerts
+    POSTGRES_PASSWORD: alerts
+    POSTGRES_DB: alerts
+    DATABASE_URL: postgresql+psycopg://alerts:alerts@postgres:5432/alerts
+    FF_NETWORK_PER_BUILD: "true"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libpq-dev
+    - pip install -U pip
+    - pip install -e .
+  script:
+    - alembic upgrade head
+
+docker-pipeline:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -f Dockerfile.pipeline -t alert-pipeline:ci .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+docker-ui:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker build -f Dockerfile.ui -t alert-ui:ci .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

@@ -131,6 +131,7 @@ class QuixStreamRuntime:
                 window_seconds=cfg.dedup_window_seconds,
                 refire_interval_seconds=cfg.refire_interval_seconds,
                 suppress_dispatch_while_acknowledged=cfg.suppress_dispatch_while_acknowledged,
+                allow_reopen_after_resolve=cfg.allow_reopen_after_resolve,
                 dedup_fields=list(cfg.dedup_fields),
             )
 
@@ -141,9 +142,8 @@ class QuixStreamRuntime:
             alert = alert_from_wire(row["alert"])
             result = processor.emit_alert(
                 alert,
-                suppress_while_acked=bool(
-                    row.get("suppress_dispatch_while_acknowledged", True)
-                ),
+                suppress_while_acked=bool(row.get("suppress_dispatch_while_acknowledged", True)),
+                allow_reopen_after_resolve=bool(row.get("allow_reopen_after_resolve", True)),
             )
             return result.to_dict()
 
@@ -191,9 +191,7 @@ def _maybe_dlq_producer(settings: Settings):  # noqa: ANN202
                 ),
             )
         except ImportError:
-            logger.warning(
-                "No Kafka producer library for DLQ; unparseable messages logged only"
-            )
+            logger.warning("No Kafka producer library for DLQ; unparseable messages logged only")
             return None
     return ("confluent", Producer({"bootstrap.servers": settings.kafka_bootstrap_servers}))
 

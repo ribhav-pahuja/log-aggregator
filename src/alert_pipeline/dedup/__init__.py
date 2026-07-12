@@ -2,7 +2,12 @@
 
 from alert_pipeline.dedup.engine import DedupEngine
 from alert_pipeline.dedup.fingerprint import compute_fingerprint
-from alert_pipeline.dedup.store import DedupStore, MemoryDedupStore, RedisDedupStore, build_dedup_store
+from alert_pipeline.dedup.store import (
+    DedupStore,
+    MemoryDedupStore,
+    RedisDedupStore,
+    build_dedup_store,
+)
 
 __all__ = [
     "DedupEngine",

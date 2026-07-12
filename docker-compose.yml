@@ -147,6 +147,8 @@ services:
       DEDUP_UPDATE_INTERVAL_SECONDS: ${DEDUP_UPDATE_INTERVAL_SECONDS:-60}
       ALERT_MIN_LEVEL: ${ALERT_MIN_LEVEL:-ERROR}
       DISPATCH_ENABLED: ${DISPATCH_ENABLED:-true}
+      # Emit path enqueues only; alert-dispatch-worker performs HTTP
+      DISPATCH_MODE: ${DISPATCH_MODE:-outbox}
       DISPATCH_ZENDUTY_ENABLED: ${DISPATCH_ZENDUTY_ENABLED:-false}
       ZENDUTY_INTEGRATION_KEY: ${ZENDUTY_INTEGRATION_KEY:-}
       ZENDUTY_API_URL: ${ZENDUTY_API_URL:-https://www.zenduty.com/api/events}
@@ -161,6 +163,45 @@ services:
       WAIT_FOR_KAFKA: "1"
       WAIT_FOR_POSTGRES: "1"
       RUN_MIGRATIONS: "1"
+    restart: unless-stopped
+    networks:
+      - alert-net
+
+  # Async notification worker — drains dispatch_outbox (Zenduty/Teams/webhook)
+  alert-dispatch-worker:
+    build:
+      context: .
+      dockerfile: ${PIPELINE_DOCKERFILE:-Dockerfile.pipeline}
+    image: ${PIPELINE_IMAGE:-alert-pipeline:local}
+    container_name: alert-dispatch-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      alert-pipeline:
+        condition: service_started
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (see .env.example)}
+      DISPATCH_ENABLED: ${DISPATCH_ENABLED:-true}
+      DISPATCH_MODE: outbox
+      DISPATCH_OUTBOX_POLL_SECONDS: ${DISPATCH_OUTBOX_POLL_SECONDS:-1}
+      DISPATCH_OUTBOX_BATCH_SIZE: ${DISPATCH_OUTBOX_BATCH_SIZE:-50}
+      DISPATCH_OUTBOX_MAX_ATTEMPTS: ${DISPATCH_OUTBOX_MAX_ATTEMPTS:-8}
+      DISPATCH_ZENDUTY_ENABLED: ${DISPATCH_ZENDUTY_ENABLED:-false}
+      ZENDUTY_INTEGRATION_KEY: ${ZENDUTY_INTEGRATION_KEY:-}
+      ZENDUTY_API_URL: ${ZENDUTY_API_URL:-https://www.zenduty.com/api/events}
+      DISPATCH_TEAMS_ENABLED: ${DISPATCH_TEAMS_ENABLED:-false}
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
+      DISPATCH_WEBHOOK_ENABLED: ${DISPATCH_WEBHOOK_ENABLED:-false}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://webhook-debug:8080/alerts}
+      WEBHOOK_HEADERS_JSON: ${WEBHOOK_HEADERS_JSON:-{"Content-Type":"application/json"}}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WAIT_FOR_KAFKA: "0"
+      WAIT_FOR_POSTGRES: "1"
+      RUN_MIGRATIONS: "1"
+    command: ["alert-dispatch-worker"]
     restart: unless-stopped
     networks:
       - alert-net

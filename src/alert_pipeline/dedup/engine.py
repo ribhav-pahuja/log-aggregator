@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime
 from uuid import uuid4
 
 from alert_pipeline.alert_config import AlertYamlConfig, RefireSettings, get_alert_config
@@ -67,7 +66,11 @@ class DedupEngine:
         if LEVEL_RANK.get(event.level, 0) < min_rank:
             return None
 
-        now_ts = time.time()
+        # Event-time for window/refire/expiry (not wall-clock processing time).
+        now_ts = event.timestamp.timestamp() if event.timestamp else time.time()
+        wall = time.time()
+        if now_ts > wall + 300:
+            now_ts = wall
         self._store.expire_stale(now_ts)
 
         fingerprint = compute_fingerprint(event, cfg.dedup_fields)
@@ -122,7 +125,9 @@ class DedupEngine:
                 event.service,
                 cfg.dedup_window_seconds,
             )
-            return self._to_alert(state, is_new=True, status=AlertStatus.OPEN, description=event.message)
+            return self._to_alert(
+                state, is_new=True, status=AlertStatus.OPEN, description=event.message
+            )
         if action == "suppress":
             logger.debug(
                 "Suppressed duplicate fingerprint=%s count=%s (redis)",

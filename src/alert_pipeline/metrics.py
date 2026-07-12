@@ -24,7 +24,9 @@ def _seconds_between(start: datetime, end: datetime) -> int:
     return max(0, int(delta.total_seconds()))
 
 
-def apply_status_timestamps(row: AlertRecord, new_status: str, *, now: datetime | None = None) -> None:
+def apply_status_timestamps(
+    row: AlertRecord, new_status: str, *, now: datetime | None = None
+) -> None:
     """Mutate row with status + TTA/TTR timestamps and durations."""
     now = now or datetime.now(timezone.utc)
     prev = row.status

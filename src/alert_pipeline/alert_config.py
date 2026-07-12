@@ -11,8 +11,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
-DEFAULT_DEDUP_FIELDS: tuple[str, ...] = ("service", "level", "labels", "message")
 from alert_pipeline.schemas import LogEvent, LogLevel
+
+DEFAULT_DEDUP_FIELDS: tuple[str, ...] = ("service", "level", "labels", "message")
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +74,7 @@ class AlertYamlConfig(BaseModel):
             data.update(self.error_codes[event.error_code])
         return RefireSettings(**data)
 
-    def resolve_for_service(
-        self, service: str, error_code: str | None = None
-    ) -> RefireSettings:
+    def resolve_for_service(self, service: str, error_code: str | None = None) -> RefireSettings:
         ev = LogEvent(service=service, error_code=error_code, message="", level=LogLevel.ERROR)
         return self.resolve_for(ev)
 

@@ -81,9 +81,7 @@ def test_memory_fallback_loads_and_paginates(tmp_path):
 def test_filter_and_search(tmp_path):
     repo = _repo(tmp_path)
     _seed(repo, 5)
-    cache = AlertReadCache(
-        repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10
-    )
+    cache = AlertReadCache(repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10)
     cache.start()
     only_checkout = cache.list_alerts_page(service="checkout", page=1, page_size=50)
     assert only_checkout.total == 2  # indices 1, 3
@@ -97,9 +95,7 @@ def test_multi_label_and_filter(tmp_path):
     """All label pairs must match (AND)."""
     repo = _repo(tmp_path)
     _seed(repo, 5, with_labels=True)
-    cache = AlertReadCache(
-        repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10
-    )
+    cache = AlertReadCache(repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10)
     cache.start()
     # even i => env=prod; i<3 => team=platform => i=0,2
     pg = cache.list_alerts_page(
@@ -124,9 +120,7 @@ def test_multi_label_and_filter(tmp_path):
 def test_db_fetch_logged_and_counted(tmp_path, caplog):
     repo = _repo(tmp_path)
     _seed(repo, 2)
-    cache = AlertReadCache(
-        repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10
-    )
+    cache = AlertReadCache(repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10)
     with caplog.at_level(logging.WARNING, logger="alert_pipeline.cache.alert_cache"):
         cache.start()
     assert cache.meta()["db_fetch_count"] == 1
@@ -138,15 +132,15 @@ def test_db_fetch_logged_and_counted(tmp_path, caplog):
         cache.invalidate()
         cache.refresh(force=True)
     assert cache.meta()["db_fetch_count"] == before + 1
-    assert any("force_refresh" in r.message for r in caplog.records if "ALERT_DB_FETCH" in r.message)
+    assert any(
+        "force_refresh" in r.message for r in caplog.records if "ALERT_DB_FETCH" in r.message
+    )
 
 
 def test_invalidate_clears_and_reload_hits_db(tmp_path):
     repo = _repo(tmp_path)
     _seed(repo, 1)
-    cache = AlertReadCache(
-        repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10
-    )
+    cache = AlertReadCache(repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10)
     cache.start()
     n1 = cache.meta()["db_fetch_count"]
     cache.invalidate()
@@ -220,7 +214,6 @@ def test_redis_stampede_lock_single_db_load(tmp_path, fakeredis_client, monkeypa
     cache2._redis = fakeredis_client
     cache2._backend = "redis"
     # Don't call start() — should pull snapshot via list_alerts_page -> _ensure_fresh
-    before = calls["n"]
     pg = cache2.list_alerts_page(page=1, page_size=10)
     assert pg.total == 3
     assert len(pg.items) == 3
@@ -232,9 +225,7 @@ def test_redis_stampede_lock_single_db_load(tmp_path, fakeredis_client, monkeypa
 
 def test_meta_exposes_db_fetch_marker(tmp_path):
     repo = _repo(tmp_path)
-    cache = AlertReadCache(
-        repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10
-    )
+    cache = AlertReadCache(repo._session_factory, redis_url="redis://127.0.0.1:1/0", ttl_seconds=10)
     cache.start()
     meta = cache.meta()
     assert meta["db_fetch_log_marker"] == "ALERT_DB_FETCH"

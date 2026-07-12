@@ -56,7 +56,11 @@ class TeamsDispatcher(AlertDispatcher):
             ],
         }
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=8), reraise=True)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+        reraise=True,
+    )
     def _post(self, body: dict) -> httpx.Response:
         with httpx.Client(timeout=15.0) as client:
             return client.post(self.webhook_url, json=body)

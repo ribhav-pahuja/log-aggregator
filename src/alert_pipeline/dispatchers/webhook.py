@@ -24,7 +24,11 @@ class WebhookDispatcher(AlertDispatcher):
         self.url = url
         self.headers = headers or {"Content-Type": "application/json"}
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=8), reraise=True)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+        reraise=True,
+    )
     def _post(self, body: dict[str, Any]) -> httpx.Response:
         with httpx.Client(timeout=15.0) as client:
             return client.post(self.url, json=body, headers=self.headers)

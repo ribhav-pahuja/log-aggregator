@@ -97,6 +97,7 @@ class DemoFireBody(BaseModel):
 class DemoResetOut(BaseModel):
     alerts_deleted: int
     dispatch_log_deleted: int
+    outbox_deleted: int = 0
 
 
 class DemoFireOut(BaseModel):
@@ -184,6 +185,21 @@ def _dispatch_out(d: CachedDispatch) -> DispatchOut:
     )
 
 
+def _rate_limit_ok(bucket: list[float], *, limit: int, window_seconds: float = 60.0) -> bool:
+    """Simple process-local sliding window. Returns True if request is allowed."""
+    import time as _time
+
+    now = _time.time()
+    cutoff = now - window_seconds
+    # prune in place
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    return True
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     repo = AlertRepository(settings.database_url)
@@ -196,6 +212,8 @@ def create_app() -> FastAPI:
         max_alerts=settings.ui_cache_max_alerts,
         key_prefix=settings.ui_cache_key_prefix,
     )
+    _demo_fire_hits: list[float] = []
+    _demo_reset_hits: list[float] = []
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -229,6 +247,15 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    def metrics():
+        from fastapi.responses import Response
+
+        from alert_pipeline.observability import metrics_payload
+
+        body, content_type = metrics_payload()
+        return Response(content=body, media_type=content_type)
 
     @app.get("/api/cache")
     def cache_meta() -> dict:
@@ -464,6 +491,10 @@ def create_app() -> FastAPI:
 
     @app.post("/api/demo/reset", response_model=DemoResetOut)
     def demo_reset() -> DemoResetOut:
+        if not _rate_limit_ok(
+            _demo_reset_hits, limit=max(5, settings.demo_rate_limit_per_minute // 3)
+        ):
+            raise HTTPException(status_code=429, detail="Demo reset rate limit exceeded")
         result = repo.clear_all()
         _touch_cache()
         logger.info("Demo reset: %s", result)
@@ -471,11 +502,17 @@ def create_app() -> FastAPI:
 
     @app.post("/api/demo/fire", response_model=DemoFireOut)
     def demo_fire(body: DemoFireBody) -> DemoFireOut:
-        from alert_pipeline.dispatchers.registry import DispatchFanout, build_dispatchers
+        from alert_pipeline.dispatchers.registry import (
+            DispatchFanout,
+            build_dispatchers,
+            enabled_channel_names,
+        )
         from alert_pipeline.schemas import ACTIVE_ALERT_STATUSES
 
+        if not _rate_limit_ok(_demo_fire_hits, limit=settings.demo_rate_limit_per_minute):
+            raise HTTPException(status_code=429, detail="Demo fire rate limit exceeded")
+
         level = LogLevel.normalize(body.severity)
-        fanout = DispatchFanout(build_dispatchers(settings), repo=repo)
         now = datetime.now(timezone.utc)
         base_log = LogEvent(
             timestamp=now,
@@ -533,7 +570,13 @@ def create_app() -> FastAPI:
             existing_id = record.id
             alert_id = record.id
             if is_first_create and i == 0:
-                fanout.dispatch(alert)
+                channels = enabled_channel_names(settings)
+                mode = (settings.dispatch_mode or "outbox").lower()
+                if mode == "inline":
+                    fanout = DispatchFanout(build_dispatchers(settings), repo=repo)
+                    fanout.dispatch(alert)
+                elif channels:
+                    repo.enqueue_dispatch(alert, channels)
 
         _touch_cache()
         if alert_id:
@@ -545,6 +588,7 @@ def create_app() -> FastAPI:
         if body.also_publish_kafka:
             try:
                 import json as _json
+
                 from confluent_kafka import Producer
 
                 producer = Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
@@ -586,7 +630,9 @@ def main() -> None:
 
     import uvicorn
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    )
     settings = get_settings()
     uvicorn.run(
         "alert_pipeline.ui.app:create_app",

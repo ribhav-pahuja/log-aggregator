@@ -12,12 +12,19 @@ from collections.abc import Sequence
 
 from alert_pipeline.schemas import LogEvent
 
-# Only strip clearly volatile tokens in messages.
+# Built-in message normalization (always on). Field *selection* is YAML-only;
+# users do not configure custom regex — only which fields participate.
 _UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
 _HEX_RE = re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE)
+_TS_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b")
+_REQ_ID_RE = re.compile(
+    r"\b(?:req(?:uest)?(?:[_-]?id)?|requestid|trace[_-]?id|span[_-]?id)"
+    r"\s*[=:]\s*[A-Za-z0-9._:-]+\b",
+    re.IGNORECASE,
+)
 _WS_RE = re.compile(r"\s+")
 
 # Built-in field names (also support label:<key> for a single label).
@@ -43,9 +50,13 @@ DEFAULT_DEDUP_FIELDS: tuple[str, ...] = (
 
 
 def _normalize_message(message: str) -> str:
-    text = (message or "").strip().lower()
+    # Strip volatile tokens before lowercasing so ISO "T" timestamps still match.
+    text = (message or "").strip()
     text = _UUID_RE.sub("<uuid>", text)
     text = _HEX_RE.sub("<hex>", text)
+    text = _TS_RE.sub("<ts>", text)
+    text = _REQ_ID_RE.sub("<req>", text)
+    text = text.lower()
     text = _WS_RE.sub(" ", text)
     return text[:500]
 

@@ -30,9 +30,7 @@ def test_upsert_creates_and_updates(tmp_path):
     r1 = repo.upsert_alert(_alert())
     assert r1.occurrence_count == 1
 
-    r2 = repo.upsert_alert(
-        _alert(occurrence_count=5, is_new=False, status=AlertStatus.UPDATED)
-    )
+    r2 = repo.upsert_alert(_alert(occurrence_count=5, is_new=False, status=AlertStatus.UPDATED))
     assert r2.id == r1.id
     assert r2.occurrence_count == 5
 
@@ -44,9 +42,7 @@ def test_upsert_never_resets_count_on_stale_new(tmp_path):
     r1 = repo.upsert_alert(_alert(occurrence_count=1))
     assert r1.occurrence_count == 1
 
-    r2 = repo.upsert_alert(
-        _alert(occurrence_count=10, is_new=False, status=AlertStatus.UPDATED)
-    )
+    r2 = repo.upsert_alert(_alert(occurrence_count=10, is_new=False, status=AlertStatus.UPDATED))
     assert r2.occurrence_count == 10
 
     # Memory lost: engine thinks new with count=1

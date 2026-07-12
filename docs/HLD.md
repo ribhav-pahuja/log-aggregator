@@ -3,9 +3,29 @@
 | | |
 | --- | --- |
 | **Status** | Living document |
-| **Version** | 0.2.0 |
+| **Version** | 0.4.0 |
+| **Last updated** | 2026-07-12 |
 | **Audience** | Engineers owning ingress, reliability, or on-call tooling |
 | **Related** | [README](../README.md), [Runtime notes](../src/alert_pipeline/runtime/README.md), [alerts.yaml](../config/alerts.yaml) |
+
+**Reading guide**
+
+| Role | Start with |
+| --- | --- |
+| New engineer / on-call | §1–3, §5–6, §13 open items |
+| Product / PM | §1, §3, §4 lifecycle |
+| Platform / ops | §6 guarantees, §9–12 |
+| Why Quix / not Redis for dedup | [Appendix A — ADRs](#appendix-a--architecture-decision-records) |
+
+### Document changelog
+
+| Version | Date | What changed |
+| --- | --- | --- |
+| 0.4.0 | 2026-07-12 | Async outbox dispatch + worker; event-time windows; allow_reopen DB check; Prometheus `/metrics`; dual CI |
+| 0.3.0 | 2026-07-08 | Restructure: current system first; data model, guarantees, scaling, security, ops signals; ADRs demoted to appendix |
+| 0.2.0 | — | Quix keyed-state dedup; Flink removal; Redis as UI cache only |
+
+**Keep aligned with:** `runtime/quix_runtime.py`, `dedup/quix_state.py`, `processing/handler.py`, `config/alerts.yaml`.
 
 ---
 
@@ -17,7 +37,7 @@ Turn a high-volume stream of application **error logs** into a small number of d
 2. **Notify** humans and systems (Zenduty, Teams, webhooks, …).
 3. **Operate** them from a shared dashboard (ack / resolve, TTA/TTR, label widgets).
 
-The pipeline is a **Python-native Quix Streams** application: Kafka consume → fingerprint co-location → keyed-state dedup → Postgres + dispatch. The operator UI is a separate FastAPI service with an optional **Redis read cache**.
+The pipeline is a **Python-native Quix Streams** application: Kafka consume → fingerprint co-location → keyed-state dedup → Postgres + dispatch. The operator UI is a **separate** FastAPI process with an optional **Redis read cache**.
 
 ### 1.1 Goals
 
@@ -37,13 +57,631 @@ The pipeline is a **Python-native Quix Streams** application: Kafka consume → 
 - Exactly-once notification guarantees across external APIs (best-effort with retries + audit).
 - Multi-engine portability (Flink / Spark / etc.) — **Quix only**.
 
+### 1.3 Success metrics (product)
+
+| Metric | Intent |
+| --- | --- |
+| Alert volume reduction | Many ERROR logs → few open incidents per fingerprint window |
+| False-merge rate | Over-broad fingerprints hide distinct failures (tune `dedup_fields`) |
+| MTTA / TTA, TTR | Operator speed; stored on incident rows when acked/resolved |
+| Dispatch reliability | Successful channel attempts vs audited failures under load |
+| Pipeline health | Consumer lag, DLQ growth, emit-path errors (Postgres / dispatch stall) |
+
 ---
 
-## 2. Key architecture decisions
+## 2. Architecture at a glance
 
-These choices were made explicitly after comparing alternatives. They are the “why” behind the current code shape.
+Two **deployable units** share Postgres (and optionally Redis for the UI):
 
-### 2.1 Decision: Quix Streams as the only pipeline runtime (not Flink)
+```
+  Producers (apps, agents, log shippers)
+           │
+           ▼
+     ┌───────────┐     ┌──────────────────────────────────────┐
+     │  Kafka    │     │  alert-pipeline (Quix Streams)         │
+     │  logs     │────►│  parse → min-level → fingerprint       │
+     │  logs-dlq │     │  group_by(fp) → keyed-state dedup      │
+     └───────────┘     │  emit → Postgres + dispatch + invalidate│
+                       └───────────┬──────────────────┬─────────┘
+                                   │                  │
+                    ┌──────────────▼──────┐   ┌───────▼────────────┐
+                    │  PostgreSQL (SoR)   │   │  Zenduty / Teams / │
+                    │  alerts             │   │  webhooks          │
+                    │  dispatch_log       │   └────────────────────┘
+                    │  dashboard_widgets  │
+                    └──────────────▲──────┘
+                                   │ read / write (ack, resolve)
+                       ┌───────────┴──────────────────┐
+                       │  alert-ui (FastAPI :8000)      │
+                       │  list, stats, widgets, demo    │
+                       │  Redis: UI snapshot cache only │
+                       └────────────────────────────────┘
+```
+
+### 2.1 Decision stack (one view)
+
+```
+  Kafka transport     →  Quix Streams
+  Fingerprint co-loc  →  group_by(fingerprint)
+  Window / refire     →  Quix per-key state
+  Incident truth      →  Postgres
+  UI poll performance →  Redis snapshot cache
+  Notifications       →  pluggable HTTP + dispatch_log
+  Flink / Redis-dedup →  rejected (see Appendix A)
+```
+
+| Concern | Owner |
+| --- | --- |
+| Active window / suppress / refire | **Quix state** |
+| Incidents, ack/resolve, TTA/TTR, audit | **Postgres** |
+| Multi-instance UI list/stats | **Redis** (optional; not on emit correctness path) |
+
+**Core idea:** Dedup co-locates with stream keys. Redis must never be the second brain for “is this fingerprint active?”
+
+---
+
+## 3. System context
+
+### 3.1 External actors
+
+| Actor | Interaction |
+| --- | --- |
+| Application / platform logging | Publishes structured log events to Kafka `logs` |
+| On-call / SRE | Uses UI to acknowledge, resolve, filter by labels |
+| Incident tools (Zenduty, Teams, custom webhooks) | Receive JSON payloads on new / refired incidents |
+| Operators | Configure windows/fields via `config/alerts.yaml` and env |
+
+### 3.2 Process topology (Compose reference)
+
+| Service | Role | Stateful? |
+| --- | --- | --- |
+| `kafka` | Log ingress | Offsets, topics |
+| `kafka-init` | Creates `logs` + `logs-dlq` | No |
+| `postgres` | SoR for alerts, dispatch_outbox, dispatch_log, widgets | Yes (volume) |
+| `redis` | **UI read cache only** | Ephemeral OK |
+| `alert-pipeline` | Quix app (state dir + Kafka state topics); enqueue only | Yes (Quix state / changelog) |
+| `alert-dispatch-worker` | Drains `dispatch_outbox` → HTTP channels | Stateless (PG) |
+| `alert-ui` | FastAPI + static UI + `/metrics` | Stateless (PG/Redis) |
+| `webhook-debug` | Optional echo sink | No |
+| `log-producer` (profile `demo`) | Synthetic traffic | No |
+
+---
+
+## 4. Data model and incident lifecycle
+
+### 4.1 LogEvent (ingress) vs Alert / incident (SoR)
+
+| Concept | Role | Durability |
+| --- | --- | --- |
+| **LogEvent** | One Kafka message after parse/normalize | Not retained by this system (except bad payloads on DLQ) |
+| **Incident (`alerts` row)** | Deduplicated open/updated/acked/resolved case | **Postgres system of record** |
+| **Quix state blob** | Live window for one fingerprint | Stream state + changelog; not the operator dashboard |
+
+**What we do not store:** every suppressed log line, full message history, or a search index over raw logs.
+
+### 4.2 Canonical LogEvent fields
+
+See `LogEvent` in `schemas.py`. Typical Kafka JSON:
+
+```json
+{
+  "timestamp": "2026-07-08T12:00:00Z",
+  "level": "ERROR",
+  "service": "payments-api",
+  "host": "pod-7",
+  "message": "connection refused to db primary",
+  "error_code": "DB_CONN",
+  "trace_id": "abc123",
+  "labels": { "env": "prod", "region": "us-east" }
+}
+```
+
+Aliases accepted at parse time include `severity`/`log_level`, `msg`/`error`, `app`/`application`, `@timestamp`/`time`, `hostname`/`pod`, etc.
+
+### 4.3 Incident row (`alerts`)
+
+| Field group | Examples |
+| --- | --- |
+| Identity | `id` (UUID), `fingerprint` |
+| Content | `title`, `description`, `sample_message`, `severity`, `service`, `host` |
+| Grouping context | `error_code`, `trace_id`, `labels_json` |
+| Counts / time | `occurrence_count`, `first_seen`, `last_seen` |
+| Operator timeline | `status`, `acknowledged_at`, `resolved_at`, `tta_seconds`, `ttr_seconds` |
+
+Related tables:
+
+| Table | Purpose |
+| --- | --- |
+| `dispatch_outbox` | Pending notification work (async worker); unique `idempotency_key` |
+| `dispatch_log` | Per-channel attempt audit (success, status_code, error, optional idempotency_key) |
+| `dashboard_widgets` | Shared UI label filters |
+
+Schema: **Alembic** (`alembic upgrade head` on entrypoint) + idempotent `create_all` fallback for tests/sqlite.
+
+### 4.4 Status lifecycle
+
+**Active** statuses (dedup merges / upserts into these rows): `open`, `updated`, `acknowledged`.
+
+```
+                    ┌─────────────┐
+         new emit → │    open     │
+                    └──────┬──────┘
+                           │ refire emit (same alert_id)
+                           ▼
+                    ┌─────────────┐
+                    │  updated    │◄── further refires
+                    └──────┬──────┘
+                           │
+              UI ack       │        UI resolve (may skip ack)
+                           ▼
+                    ┌─────────────┐         ┌─────────────┐
+                    │acknowledged │────────►│  resolved   │
+                    └─────────────┘  resolve└─────────────┘
+                           │
+                           │ optional: un-ack → open/updated path in UI
+                           ▼
+                    (status rewrite; TTA may be recomputed)
+```
+
+| Transition | Who | Notes |
+| --- | --- | --- |
+| → `open` | Pipeline | New fingerprint window / expired window |
+| → `updated` | Pipeline | Refire within window (same `alert_id`) |
+| → `acknowledged` | Operator UI | Sets `acknowledged_at`, computes **TTA** |
+| → `resolved` | Operator UI | Sets `resolved_at`, computes **TTR** |
+| Reopen after resolve | Policy | YAML `allow_reopen_after_resolve`; when **false**, emit path skips if only a **resolved** row exists for the fingerprint (no new incident). When **true**, a new row may be opened (new UUID if Quix reuses a resolved PK). |
+
+Partial unique index on **active** fingerprint reduces duplicate open rows under races. Upsert **never decreases** `occurrence_count` when the DB already holds a higher active count.
+
+### 4.5 Fingerprint
+
+**Fingerprint** = first 32 hex chars of SHA-256 over an ordered, normalized field list from YAML.
+
+Default fields: `service`, `level`, `labels`, `message` (**host excluded** for fleet-wide collapse).
+
+**User control** is field selection only (`dedup_fields` under defaults / services / error_codes). Built-in message normalization (not YAML-configurable) strips UUIDs, long hex, ISO timestamps, and request/trace id tokens. Changing `dedup_fields` produces **new** fingerprint strings → new incident groups (existing open rows are not rewritten).
+
+---
+
+## 5. Components and processing path
+
+### 5.1 Layered view (two processes)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Presentation (alert-ui)                                          │
+│  Static assets + FastAPI REST (list, stats, ack/resolve,         │
+│  widgets, demo fire)                                              │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ reads via AlertReadCache (Redis)
+┌───────────────────────────────▼─────────────────────────────────┐
+│  Application services                                             │
+│  • Quix runtime (alert-pipeline): enrich → group_by → state → emit│
+│  • AlertProcessor.emit_alert (Postgres + outbox + UI invalidate)  │
+│  • Dispatch worker + DispatchFanout + pluggable channels          │
+│  • AlertRepository (CRUD + upsert + outbox + audit)               │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────┐
+│  Domain                                                           │
+│  • Fingerprint (configurable fields)                              │
+│  • quix_state window/refire transitions                           │
+│  • AlertEvent / LogEvent schemas, severity ranking                │
+│  • YAML alert config (defaults ← service ← error_code)            │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────┐
+│  Infrastructure                                                   │
+│  • Quix Streams + Kafka (ingress, repartition, changelog, DLQ)    │
+│  • PostgreSQL (+ Alembic)                                         │
+│  • Redis (UI snapshot only)                                       │
+│  • httpx + tenacity (outbound dispatch)                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 End-to-end processing path
+
+```
+Kafka(logs)
+  → safe JSON deserialize (bad → logs-dlq)
+  → min-level filter (YAML / env)
+  → build fingerprint + enrichment row
+  → group_by(fingerprint)          # co-locate same incident key
+  → stateful process_enriched_with_state()
+        new | suppress | refire update
+  → on emit: AlertProcessor.emit_alert()
+        1. allow_reopen policy check (DB status)
+        2. upsert Postgres
+        3. invalidate UI Redis snapshot (optional)
+        4. enqueue dispatch_outbox per channel (idempotency_key)
+           (skip if refire + acked + suppress_dispatch_while_acknowledged)
+  → alert-dispatch-worker claims outbox → HTTP + dispatch_log
+```
+
+### 5.3 Ingress contract (Kafka)
+
+| Item | Value |
+| --- | --- |
+| Input topic | `logs` (`KAFKA_INPUT_TOPIC`) |
+| DLQ | `logs-dlq` for unparseable payloads (when enabled) |
+| Internal (Quix) | `repartition__*` and `changelog__*` for `group_by` / state |
+| Consumer group | `alert-pipeline` |
+| Delivery from Kafka | **At-least-once**; pipeline must tolerate reprocessing |
+
+Broker auto-create can stay **off**; Quix uses the Admin API for internal topics (`auto_create_topics` for those).
+
+**DLQ policy (current):** unparseable messages are routed when enabled; **no built-in redrive consumer**. Operators should alert on DLQ depth/rate and inspect payloads manually or with a separate redrive tool.
+
+### 5.4 Quix keyed-state dedup
+
+After `group_by(fingerprint)`, each key holds an incident blob: `alert_id`, counts, `last_emitted_at`, severity, sample message, window, etc.
+
+| Case | Behaviour |
+| --- | --- |
+| No state / window expired | Open **new** incident (`is_new=True`), store state |
+| Within window, before refire | Increment count; **suppress** emit |
+| Within window, refire due | Emit **updated** with same `alert_id` |
+| After idle beyond window | Next event treated as new |
+
+**Time model:** window and refire use **event time** (`event.timestamp`). Far-future timestamps are clamped to wall-clock (±5 min skew). Injectable `now` remains for unit tests. There is still **no full watermark / late-data side output** — very late events can reopen windows relative to their own timestamps.
+
+Unit tests: `tests/test_quix_dedup_state.py`, `tests/test_event_time.py`. In-process `DedupEngine` + memory store remain for **unit tests only**, not multi-worker production.
+
+### 5.5 AlertProcessor (persist + outbox)
+
+- **`emit_alert`**: production path after Quix state decides to emit.
+- **`handle_event`**: in-process engine for tests only.
+- Order on emit: **reopen policy → Postgres upsert → optional Redis invalidate → outbox enqueue** (or `DISPATCH_MODE=inline` for sync fan-out).
+
+### 5.6 Dispatch (outbox + worker)
+
+Default **`DISPATCH_MODE=outbox`**:
+
+1. Emit path inserts one `dispatch_outbox` row per enabled channel with  
+   `idempotency_key = {alert_id}:{channel}:{occurrence_count}` (unique).
+2. **`alert-dispatch-worker`** claims due rows (`pending`/`failed`), calls the channel, writes `dispatch_log`, marks `sent` / retries with backoff / `dead` after max attempts.
+3. Reprocessing that re-enqueues the same key is a no-op; worker also skips if audit already has a successful row for that key.
+
+`DISPATCH_MODE=inline` keeps legacy sync fan-out on the emit path (tests / simple demos only).
+
+Channel HTTP still uses **tenacity** inside each dispatcher. Payload: `AlertEvent.to_dispatch_dict()`.
+
+### 5.7 Operator UI and Redis (read path only)
+
+| Path | Behaviour |
+| --- | --- |
+| Writes (ack/resolve/widgets) | Postgres, then cache invalidate |
+| Pipeline emit | Postgres, then optional invalidate |
+| Reads | Shared Redis snapshot (TTL, `SET NX` stampede lock, memory/DB fallback) |
+
+**Does not implement pipeline dedup.** Multi-instance UI: after invalidate, instances converge on the next cache miss (eventual consistency for list/stats; operators should treat SoR as Postgres).
+
+---
+
+## 6. Correctness, delivery, and failure modes
+
+### 6.1 Guarantees
+
+| Property | Guarantee | Mechanism | Known holes |
+| --- | --- | --- | --- |
+| Kafka consume | At-least-once | Consumer offsets / Quix commit semantics | Reprocess can re-enter state machine |
+| Per-fingerprint co-location | Same fp → same state partition after `group_by` | Quix repartition | Hot keys pin one worker |
+| Global event order | **None** | — | Only per-key ordering after co-location |
+| Suppress within window | Best-effort in live state | Quix keyed state | Restart/reprocess edge cases; not a global lock service |
+| Incident durability | Strong once upsert commits | Postgres | State may advance before upsert if process dies mid-pipeline (engine-dependent) |
+| `occurrence_count` | Non-decreasing on active upsert | Repository logic | Suppressed events never hit DB → counts lag true log volume |
+| Active fingerprint uniqueness | Soft guarantee | Partial unique index + upsert retry | Races resolved to one active row |
+| Notifications | **At-least-once / best-effort** with per-channel idempotency keys | Outbox unique key + audit skip | Worker crash mid-send can still duplicate if channel is not idempotent |
+| Exactly-once notify | **Not provided** end-to-end | — | External APIs may not honor our keys |
+| UI cache freshness | Best-effort | Invalidate on write + TTL | Brief staleness multi-instance |
+
+### 6.2 Emit-path ordering and partial failure
+
+Intended order in `emit_alert` (outbox mode):
+
+1. **Reopen policy** (optional skip).
+2. **Upsert Postgres** (incident visible to operators).
+3. **Invalidate UI cache** (best-effort; failure should not block).
+4. **Enqueue outbox** rows (same DB; unique key prevents dup enqueue).
+
+| Crash / failure point | Likely outcome |
+| --- | --- |
+| After state emit decision, before upsert | May reprocess; state may re-emit; outbox key still unique after successful enqueue |
+| After upsert, before enqueue | Incident exists; no notify until next refire/reprocess |
+| Worker fails HTTP | Row retries with backoff then `dead`; check outbox + `dispatch_log` |
+| Redis down on invalidate | UI may show stale list until TTL/miss; **dedup unaffected** |
+
+**Capacity:** HTTP is **off** the Quix sink path in outbox mode. Scale workers horizontally; watch `alert_pipeline_outbox_pending`.
+
+### 6.3 Key sequences
+
+#### New incident
+
+```
+Producer → Kafka(logs) → Quix enrich → group_by(fp)
+  → state: empty → emit new AlertEvent
+  → repo.upsert INSERT → dispatch fan-out → UI cache invalidate
+```
+
+#### Duplicate within window (suppressed)
+
+```
+… → state: active, refire not due → return None
+  → no DB write, no dispatch
+```
+
+#### Refire
+
+```
+… → state: emit updated (same alert_id, count++)
+  → repo.upsert UPDATE → maybe suppress if acknowledged → else dispatch
+```
+
+#### Operator acknowledge
+
+```
+UI POST status=acknowledged → Postgres TTA → cache.invalidate
+  → later refires may skip notify (YAML suppress_dispatch_while_acknowledged)
+```
+
+#### Resolve (and reopen policy)
+
+```
+UI POST status=resolved → Postgres TTR → cache.invalidate
+  → active unique index no longer covers row
+  → further matching logs: new open incident if Quix window expired / new state;
+    YAML allow_reopen_after_resolve governs product expectation — verify in ops runbooks
+```
+
+#### Pipeline restart
+
+```
+Quix recovers per-key state via changelog / state dir
+  → DB upsert protects counts on re-emit
+  → downstream may see duplicate notifications (at-least-once)
+```
+
+#### UI multi-instance after write
+
+```
+Instance A writes Postgres + invalidate
+  → Instance B cache miss (or TTL) → rebuild snapshot from DB
+  → brief window where B may serve pre-invalidate snapshot
+```
+
+### 6.4 Failure modes summary
+
+| Failure | Expected behaviour |
+| --- | --- |
+| Malformed Kafka message | Route to **DLQ** when enabled; do not invent incidents |
+| Postgres down | Emit path fails; page on pipeline health / lag |
+| Redis down | UI degrades (DB / local fallback); **pipeline dedup continues** |
+| Downstream webhook 5xx | Retries then audit failure; incident remains |
+| Pipeline restart | State recovery; upsert protects counts; possible re-notify |
+| Extreme ERROR flood | Sync dispatch + DB emit pressure; lag grows (see §11) |
+
+---
+
+## 7. Configuration and policy
+
+### 7.1 Layers
+
+| Layer | Examples | Notes |
+| --- | --- | --- |
+| Env / `.env` / Compose | Kafka, `DATABASE_URL`, Redis UI URL, dispatch enable flags, secrets | Process restart typically required |
+| YAML (`config/alerts.yaml`) | Dedup fields, windows, min level, per-service / error_code overrides | Path via `ALERT_CONFIG_PATH`; treat reload as restart-safe unless explicitly hot-reloaded |
+| Code defaults | Pydantic `Settings` (sqlite only for unit tests) | Never rely on demo defaults for prod secrets |
+
+### 7.2 YAML merge order
+
+```
+defaults  ←  services.<name>  ←  error_codes.<code>
+```
+
+Later layers override earlier for the same keys.
+
+### 7.3 `dedup_fields`
+
+Supported values (see comments in `alerts.yaml` / `KNOWN_FIELDS`):
+
+| Field | Meaning |
+| --- | --- |
+| `service`, `level` / `severity`, `message`, `labels` | Common defaults |
+| `error_code`, `host`, `trace_id` | Optional tightening / splitting |
+| `label:<name>` or `labels.<name>` | Single label key (e.g. `label:env`) |
+
+Only listed fields participate. **Host is not in the default set** (fleet-wide collapse). Add `host` when per-node incidents are required.
+
+**Changing fingerprint policy in production:** expect a burst of **new** incidents (new hashes). Prefer deliberate rollouts; do not assume old open rows merge into new fingerprints.
+
+### 7.4 Behavioural defaults (illustrative)
+
+From `config/alerts.yaml` (may change — treat file as source of truth):
+
+| Setting | Typical default |
+| --- | --- |
+| `min_level` | `ERROR` |
+| `dedup_window_seconds` | `300` |
+| `refire_interval_seconds` | `60` |
+| `suppress_dispatch_while_acknowledged` | `true` |
+| `allow_reopen_after_resolve` | `true` |
+
+Env can also influence min-level / window settings via `Settings` for tests and overrides — when both env and YAML apply, **document the effective precedence in deploy config** and prefer a single source in production.
+
+---
+
+## 8. Security and trust assumptions
+
+| Area | Current stance |
+| --- | --- |
+| UI authentication | **None** — assume private network / gateway until OIDC (e.g. Keycloak) or reverse-proxy auth is added |
+| Threat model (today) | Trusted operators on a perimeter-controlled network; not multi-tenant internet SaaS |
+| Demo endpoints | Process-local rate limits on `/api/demo/*` (`DEMO_RATE_LIMIT_PER_MINUTE`) |
+| DB credentials | Compose requires `POSTGRES_*` / `DATABASE_URL` from `.env` (no silent production secrets in compose) |
+| Dispatch secrets | Zenduty/Teams/webhook URLs and tokens via env; rotate by redeploying worker with new env |
+| Network trust | Pipeline can reach Kafka, Postgres, Redis (UI); **worker** needs egress to notification endpoints |
+| Multi-instance UI | Shared Redis + Postgres; no per-user isolation |
+
+**Before public or shared-network exposure:** add auth at the gateway (or app), restrict webhook egress, and audit who can resolve/ack.
+
+---
+
+## 9. Observability and operational signals
+
+### 9.1 Two kinds of “metrics”
+
+| Kind | What | Where |
+| --- | --- | --- |
+| **Operator SLIs** | TTA / TTR, open counts, severity mix | Postgres fields + UI stats |
+| **Pipeline SRE signals** | Emits, skips, outbox enqueue/process, dispatch success/fail | Prometheus text on UI **`GET /metrics`** (`observability.py`) |
+
+### 9.2 Logging (current)
+
+Process logs for: new incident, suppress (debug), outbox enqueue, dispatch ok/fail, UI cache miss markers (e.g. `ALERT_DB_FETCH`).
+
+### 9.3 Recommended alerts on the pipeline itself
+
+| Signal | Why |
+| --- | --- |
+| Consumer lag / stall | Postgres outage or Quix state issues (HTTP no longer on hot path in outbox mode) |
+| `alert_pipeline_outbox_pending` growth | Worker down or channel outage |
+| DLQ message rate / depth | Bad producers or schema drift |
+| Emit / upsert errors | SoR unavailable |
+| Dispatch failure / dead outbox rate | On-call noise or silent miss depending on channel |
+| Pipeline / worker restart loops | State/config/image issues |
+
+### 9.4 Testing strategy (design contracts)
+
+| Layer | What it locks |
+| --- | --- |
+| Unit: `tests/test_quix_dedup_state.py`, `test_event_time.py` | Window / refire / event-time |
+| Unit: `tests/test_outbox.py` | Enqueue, worker drain, idempotency, reopen policy |
+| Unit: fingerprint / config / dispatchers / repository | Policy and persistence edges |
+| CI | GitHub Actions + GitLab CI (lint, pytest, alembic, docker build) |
+| Compose demo | End-to-end smoke (not full HA) |
+| Not fully automated | Chaos restart mid-dispatch, multi-replica partition rebalance under flood |
+
+---
+
+## 10. Scaling and capacity
+
+| Factor | Guidance |
+| --- | --- |
+| Horizontal scale | Pipeline **replicas should not exceed** co-location topic partition count after `group_by` (plus Kafka input partitions for the pre-`group_by` stage) |
+| Hot keys | One noisy fingerprint co-locates on one partition/worker — refire and DB emit concentrate there |
+| Key distribution | Fingerprint cardinality drives balance; very low-cardinality fields (e.g. only `service`) worsen skew |
+| Emit cost | Each emit = DB write + N outbox rows; HTTP cost moves to workers |
+| UI scale | Horizontal UI instances + shared Redis; single UI can run without Redis at higher DB load |
+| When to redesign | Extreme ERROR floods where Quix state + DB upsert cannot keep lag bounded → coarser emit policy / more partitions |
+
+**Local Compose is not HA.** Production should size partitions for expected fingerprint parallelism and watch lag under load tests.
+
+### Quix state / changelog ops (runbook notes)
+
+| Topic | Guidance |
+| --- | --- |
+| Changelog / repartition topics | Created by Quix Admin API; set **compaction** on changelogs and retention aligned with max recovery needs |
+| State size | Grows with active fingerprints in-window; expired keys drop on next event for that key — watch partition disk |
+| Recovery | Rebuild state from changelog + replay; **Postgres remains SoR** for operators |
+| Multi-replica | Correctness relies on Kafka partitioning after `group_by`; do not run more pipeline replicas than useful partitions |
+| Postgres | Prefer connection pooling (managed PG or pgbouncer); archive/resolve history for large tables over time |
+
+---
+
+## 11. Deployment
+
+### 11.1 Local / demo (Compose)
+
+```bash
+cp .env.example .env
+docker compose up --build -d
+# optional: docker compose --profile demo up -d
+```
+
+Single Kafka, Postgres, Redis (UI), pipeline, UI. Not HA.
+
+### 11.2 Production sketch
+
+| Concern | Recommendation |
+| --- | --- |
+| Kafka | Managed; explicit `logs` / `logs-dlq`; allow Quix internal topics; set retention/compaction for DLQ/changelogs intentionally |
+| Pipeline | Replicas sized to partitions; healthy Quix state/changelogs; pin image digests (`Dockerfile.pipeline`) |
+| Dispatch worker | One or more `alert-dispatch-worker` processes; scale with outbox backlog |
+| Postgres | Managed SoR; Alembic in CI/CD; **backup/restore is mandatory** (incidents are not fully rebuildable from short log retention alone) |
+| Quix state | Rebuildable in principle from replay + policy, but **not** a substitute for Postgres backups |
+| Redis | Managed **for UI cache only**; optional if single UI + acceptable DB load |
+| UI | Auth proxy (Keycloak/OIDC deferred); scale horizontally with shared Redis (`Dockerfile.ui`) |
+| HA expectation | Multi-replica pipeline only with correct partition/state story; do not assume active-active without load testing |
+
+---
+
+## 12. Hardening status
+
+### Implemented
+
+| Item | Status |
+| --- | --- |
+| Quix-only runtime; Flink removed | Done |
+| Quix `group_by` + keyed-state dedup | Done |
+| Redis reserved for UI cache (not dedup) | Done |
+| Partial unique index on active fingerprint | Done |
+| Upsert never resets `occurrence_count` on stale `is_new` | Done |
+| Broker auto-create topics disabled; Quix Admin creates repartition/changelog | Done |
+| `logs-dlq` + unparseable routing | Done |
+| Required DB env in compose; Alembic on boot | Done |
+| Split `Dockerfile.pipeline` / `Dockerfile.ui` | Done |
+| Webhook dispatch opt-in by default in compose | Done |
+| Pipeline invalidates UI Redis snapshot on write | Done |
+| Async `dispatch_outbox` + `alert-dispatch-worker` | Done |
+| Per-channel idempotency keys | Done (external APIs may still duplicate) |
+| Event-time windows / refire | Done |
+| `allow_reopen_after_resolve` consults DB | Done |
+| Prometheus `/metrics` on UI | Done |
+| GitHub Actions + GitLab CI | Done |
+
+### Still open / roadmap
+
+| Issue | Direction |
+| --- | --- |
+| UI unauthenticated | Gateway auth / Keycloak OIDC (deferred) |
+| Exactly-once notify end-to-end | Channel-side idempotency support |
+| Full watermark / late data side outputs | Advanced stream time semantics |
+| DLQ redrive | Tooling + ownership |
+| Incremental UI cache / no hard 2000 cap | Cache redesign |
+
+---
+
+## 13. Open decisions
+
+| Topic | Options | Notes |
+| --- | --- | --- |
+| Auth for UI | None (today) / reverse proxy / Keycloak OIDC | Required off private networks; Keycloak deferred |
+| Ingress Kafka key | None vs pre-set fingerprint | `group_by` already re-keys; optional optimization |
+| Postgres-assisted counts | Emit-only counts vs update DB every event | Accuracy vs write load |
+
+**Closed decisions (see Appendix A):** Quix-only runtime; no Redis dedup; no Flink dual path; **outbox dispatch**; **event-time windows**.
+
+---
+
+## 14. Design principles
+
+1. **One stream runtime (Quix)** — no dual Flink path to maintain.
+2. **Dedup co-located with stream keys** — `group_by(fingerprint)` + Quix state, not an external cache.
+3. **Postgres is operator truth** — ack/resolve, TTA/TTR, widgets, audit.
+4. **Redis is a UI performance tool** — never required for emit/suppress correctness.
+5. **Policy in YAML** — windows and fingerprint fields without code changes.
+6. **Dispatch is pluggable, async, and audited** — outbox + worker + `dispatch_log` + idempotency keys.
+7. **Demo defaults ≠ production secrets** — required env for DB credentials.
+8. **At-least-once is honest** — design for idempotent upserts and audited notify, not false exactly-once claims.
+9. **Event-time for windows** — log timestamps drive suppress/refire; clamp far-future skew.
+
+---
+
+## Appendix A — Architecture decision records
+
+These choices explain the “why” behind the current shape. They are **accepted** historical decisions, not the primary onboarding path.
+
+### A.1 Decision: Quix Streams as the only pipeline runtime (not Flink)
 
 | | |
 | --- | --- |
@@ -68,7 +706,7 @@ These choices were made explicitly after comparing alternatives. They are the �
 | **Ops surface** | Process + Kafka consumer group | Cluster or mini-cluster, checkpoints, savepoints, JARs | **Quix** — no JobManager/TaskManager |
 | **Local / Compose DX** | One Dockerfile, fast rebuild | Separate Flink image, version pins, ARM/Python pain | **Quix** |
 | **Keyed co-location** | `group_by(fingerprint)` + stateful apply + repartition/changelog topics | First-class `keyBy` + ValueState | **Flink stronger in theory**; **Quix enough** for alert windows |
-| **Fit to problem** | “Smart Kafka consumer with state” | General-purpose distributed stream processor | **Quix** — we need collapse-and-notify, not CEP/SQL at scale |
+| **Fit to problem** | “Smart Kafka consumer with state” | General-purpose distributed stream processor | **Quix** — collapse-and-notify, not CEP/SQL at scale |
 | **Image size / supply chain** | Python deps only | JDK + Flink + connectors | **Quix** |
 | **Risk of half-supported dual path** | Single path to maintain | Dual runtime always lags | **Quix-only** avoids “works on Quix, broken on Flink” |
 
@@ -86,7 +724,7 @@ These choices were made explicitly after comparing alternatives. They are the �
 
 ---
 
-### 2.2 Decision: Dedup lives in Quix keyed state (not Redis)
+### A.2 Decision: Dedup lives in Quix keyed state (not Redis)
 
 | | |
 | --- | --- |
@@ -114,18 +752,6 @@ These choices were made explicitly after comparing alternatives. They are the �
 | **Semantics** | Window/refire next to consume path | TTL keys good for “forget after N seconds” but easy to diverge from DB `alert_id` | **Quix** keeps window next to processing |
 | **Multi-instance correctness** | Same fingerprint → same key → same state partition | Works if all workers use Redis correctly | Both viable; **Quix chosen for co-location + fewer systems on the hot path** |
 
-#### Why Redis is still in the architecture
-
-Redis **is** retained for a **different** job:
-
-| Use | Technology |
-| --- | --- |
-| Active incident window / suppress / refire | **Quix state** |
-| Operator UI list/stats under multi-instance poll | **Redis snapshot cache** (TTL, stampede lock, invalidate on write) |
-| Durable incidents, ack/resolve, TTA/TTR, audit | **Postgres** |
-
-This avoids a dual-brain problem: Redis must not disagree with Quix about “is this fingerprint active?” while the UI still benefits from a shared read cache.
-
 #### Trade-offs we accept
 
 - Quix creates internal **`repartition__*`** and **changelog** topics (Admin API; broker auto-create can stay off).
@@ -143,364 +769,55 @@ This avoids a dual-brain problem: Redis must not disagree with Quix about “is 
 
 ---
 
-### 2.3 Decision summary (one view)
-
-```
-                    ┌──────────────────────────────────────┐
-                    │           Decision stack               │
-                    ├──────────────────────────────────────┤
-                    │  Kafka transport     →  Quix           │
-                    │  Fingerprint co-loc  →  group_by       │
-                    │  Window / refire     →  Quix State     │
-                    │  Incident truth      →  Postgres       │
-                    │  UI poll performance →  Redis cache    │
-                    │  Notifications      →  pluggable HTTP │
-                    │  Flink               →  removed        │
-                    │  Redis for dedup     →  rejected       │
-                    └──────────────────────────────────────┘
-```
-
----
-
-## 3. System context
-
-```
-                    ┌──────────────────────────────────────────────────┐
-                    │                  This system                      │
-  Producers         │                                                  │
-  (apps, agents,    │   Kafka          Quix pipeline      Postgres     │
-   log shippers) ──►│   logs ────────► group_by+state ──► alerts       │
-                    │   logs-dlq         │                 dispatch_log │
-                    │                    │                 widgets      │
-                    │                    ▼                              │
-                    │              Dispatchers ──► Zenduty / Teams /    │
-                    │                              webhooks             │
-                    │                    │                              │
-                    │                    ▼                              │
-                    │              Operator UI ◄── Redis (UI cache)     │
-                    │              (FastAPI :8000)                       │
-                    └──────────────────────────────────────────────────┘
-```
-
-**External actors**
-
-| Actor | Interaction |
-| --- | --- |
-| Application / platform logging | Publishes structured log events to Kafka `logs` |
-| On-call / SRE | Uses UI to acknowledge, resolve, filter by labels |
-| Incident tools (Zenduty, Teams, custom webhooks) | Receive JSON payloads on new / refired incidents |
-| Operators | Configure windows/fields via `config/alerts.yaml` and env |
-
----
-
-## 4. Architecture overview
-
-### 4.1 Layered view
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Presentation                                                     │
-│  UI static assets + FastAPI REST (list, stats, ack/resolve,      │
-│  widgets, demo fire)                                              │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │ reads via AlertReadCache (Redis)
-┌───────────────────────────────▼─────────────────────────────────┐
-│  Application services                                             │
-│  • Quix runtime: enrich → group_by → state dedup → emit           │
-│  • AlertProcessor.emit_alert (Postgres + dispatch + UI invalidate)│
-│  • DispatchFanout + pluggable AlertDispatcher implementations     │
-│  • AlertRepository (CRUD + upsert + audit)                        │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-┌───────────────────────────────▼─────────────────────────────────┐
-│  Domain                                                           │
-│  • Fingerprint (configurable fields)                              │
-│  • quix_state window/refire transitions                           │
-│  • AlertEvent / LogEvent schemas, severity ranking                │
-│  • YAML alert config (defaults ← service ← error_code)            │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-┌───────────────────────────────▼─────────────────────────────────┐
-│  Infrastructure                                                   │
-│  • Quix Streams + Kafka (ingress, repartition, changelog, DLQ)    │
-│  • PostgreSQL (+ Alembic)                                         │
-│  • Redis (UI snapshot only)                                       │
-│  • httpx + tenacity (outbound dispatch)                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 End-to-end processing path
-
-```
-Kafka(logs)
-  → safe JSON deserialize (bad → logs-dlq)
-  → min-level filter (YAML / env)
-  → build fingerprint + enrichment row
-  → group_by(fingerprint)          # co-locate same incident key
-  → stateful process_enriched_with_state()
-        new | suppress | refire update
-  → on emit: AlertProcessor.emit_alert()
-        upsert Postgres
-        invalidate UI Redis snapshot (optional)
-        fan-out dispatchers (+ dispatch_log)
-```
-
-### 4.3 Process topology (Compose reference)
-
-| Service | Role | Stateful? |
-| --- | --- | --- |
-| `kafka` | Log ingress | Offsets, topics |
-| `kafka-init` | Creates `logs` + `logs-dlq` | No |
-| `postgres` | SoR for alerts, dispatch_log, widgets | Yes (volume) |
-| `redis` | **UI read cache only** | Ephemeral OK |
-| `alert-pipeline` | Quix app (state dir + Kafka state topics) | Yes (Quix state / changelog) |
-| `alert-ui` | FastAPI + static UI | Stateless (PG/Redis) |
-| `webhook-debug` | Optional echo sink | No |
-| `log-producer` (profile `demo`) | Synthetic traffic | No |
-
----
-
-## 5. Major components
-
-### 5.1 Ingress contract (Kafka)
-
-- **Topic:** `logs` (configurable via `KAFKA_INPUT_TOPIC`).
-- **DLQ:** `logs-dlq` for unparseable payloads (when enabled).
-- **Internal (Quix):** `repartition__*` and `changelog__*` topics created by the app for `group_by` / state.
-- **Consumer group:** `alert-pipeline`.
-- **Semantic model:** at-least-once from Kafka; pipeline must tolerate reprocessing.
-
-**Canonical log fields** (see `LogEvent`): `timestamp`, `level`, `service`, `host`, `message`, `error_code`, `trace_id`, `labels`.
-
-### 5.2 Fingerprinting & configuration
-
-**Fingerprint** = first 32 hex chars of SHA-256 over an ordered, normalized field list from YAML.
-
-Default fields: `service`, `level`, `labels`, `message` (host **excluded** for fleet-wide collapse).
-
-**Config merge:** `defaults ← services.<name> ← error_codes.<code>`.
-
-### 5.3 Quix keyed-state dedup (`dedup/quix_state.py`)
-
-After `group_by(fingerprint)`, each key holds an incident blob:
-
-- `alert_id`, counts, `last_emitted_at`, severity, sample message, window, etc.
-
-| Case | Behaviour |
-| --- | --- |
-| No state / window expired | Open **new** incident (`is_new=True`), store state |
-| Within window, before refire | Increment count; **suppress** emit |
-| Within window, refire due | Emit **updated** with same `alert_id` |
-| After idle beyond window | Next event treated as new |
-
-Unit tests cover transitions without Kafka (`tests/test_quix_dedup_state.py`). In-process `DedupEngine` remains for **unit tests only**, not multi-worker production.
-
-### 5.4 AlertProcessor (persist + dispatch)
-
-- **`emit_alert`**: path used by Quix after state decides to emit.
-- **`handle_event`**: in-process engine for tests.
-- Upsert never decreases `occurrence_count` when DB already has a higher active count.
-- Partial unique index on active fingerprint reduces duplicate open rows under races.
-- Optional UI cache invalidation after write (`ui_cache_invalidate.py`).
-
-### 5.5 Persistence
-
-| Table | Purpose |
-| --- | --- |
-| `alerts` | Incidents; active rows matched by fingerprint + status |
-| `dispatch_log` | Per-channel attempt audit |
-| `dashboard_widgets` | Shared UI filters |
-
-Schema: **Alembic** (`alembic upgrade head` on entrypoint) + idempotent `create_all` fallback for tests/sqlite.
-
-### 5.6 Dispatch
-
-`AlertDispatcher` ABC → Zenduty / Teams / Webhook via `build_dispatchers()` + `DispatchFanout` + tenacity retries + `dispatch_log`.
-
-### 5.7 Operator UI & Redis (read path only)
-
-- Writes: Postgres, then cache invalidate.
-- Reads: shared Redis snapshot (TTL, `SET NX` lock, memory fallback).
-- **Does not implement pipeline dedup.**
-
----
-
-## 6. Key sequences
-
-### 6.1 New incident
-
-```
-Producer → Kafka(logs) → Quix enrich → group_by(fp)
-  → state: empty → emit new AlertEvent
-  → repo.upsert INSERT → dispatch fan-out → UI cache invalidate
-```
-
-### 6.2 Duplicate within window (suppressed)
-
-```
-… → state: active, refire not due → return None
-  → no DB write, no dispatch
-```
-
-### 6.3 Refire
-
-```
-… → state: emit updated (same alert_id, count++)
-  → repo.upsert UPDATE → maybe suppress if acknowledged → else dispatch
-```
-
-### 6.4 Operator acknowledge
-
-```
-UI POST status=acknowledged → Postgres TTA → cache.invalidate
-  → later refires may skip notify (YAML suppress_dispatch_while_acknowledged)
-```
-
----
-
-## 7. Cross-cutting concerns
-
-### 7.1 Configuration
-
-| Layer | Examples |
-| --- | --- |
-| Env / `.env` / Compose | Kafka, DB, Redis (UI), dispatch flags |
-| YAML | Dedup fields, windows, min level, overrides |
-| Code defaults | Settings pydantic (sqlite for unit tests only) |
-
-### 7.2 Security
-
-- Compose requires `POSTGRES_*` / `DATABASE_URL` from `.env` (no silent secret defaults in compose for app DB URL).
-- UI has **no auth** — assume network perimeter until auth is added.
-
-### 7.3 Observability
-
-- Process logs (new incident, suppress, dispatch ok/fail, `ALERT_DB_FETCH` on UI cache miss).
-- No Prometheus exporter by default.
-
-### 7.4 Failure modes
-
-| Failure | Expected behaviour |
-| --- | --- |
-| Malformed Kafka message | Route to **DLQ** when enabled; do not invent incidents |
-| Postgres down | Emit path fails; restart / alert on pipeline |
-| Redis down | UI degrades (DB / local fallback); **pipeline dedup continues** (Quix state) |
-| Downstream webhook 5xx | Retries then audit failure; incident remains |
-| Pipeline restart | Quix state recovery via changelog/state dir; DB upsert protects counts |
-
----
-
-## 8. Hardening status
-
-### Implemented
-
-| Item | Status |
-| --- | --- |
-| Quix-only runtime; Flink removed | Done |
-| Quix `group_by` + keyed-state dedup | Done |
-| Redis reserved for UI cache (not dedup) | Done |
-| Partial unique index on active fingerprint | Done |
-| Upsert never resets `occurrence_count` on stale `is_new` | Done |
-| Broker auto-create topics disabled; Quix Admin creates repartition/changelog | Done |
-| `logs-dlq` + unparseable routing | Done |
-| Required DB env in compose; Alembic on boot | Done |
-| Split `Dockerfile.pipeline` / `Dockerfile.ui` | Done |
-| Webhook dispatch opt-in by default in compose | Done |
-| Pipeline invalidates UI Redis snapshot on write | Done |
-
-### Still open
-
-| Issue | Direction |
-| --- | --- |
-| Sync dispatch on consume path | Outbox / async notify workers |
-| UI unauthenticated | Gateway auth / OIDC |
-| Exactly-once notifications | Idempotency keys per channel |
-
----
-
-## 9. Deployment
-
-### 9.1 Local / demo (Compose)
-
-```bash
-cp .env.example .env
-docker compose up --build -d
-# optional: docker compose --profile demo up -d
-```
-
-Single Kafka, Postgres, Redis (UI), pipeline, UI. Not HA.
-
-### 9.2 Production sketch
-
-| Concern | Recommendation |
-| --- | --- |
-| Kafka | Managed; explicit `logs` / `logs-dlq` + allow Quix internal topics |
-| Pipeline | Replicas sized to partitions; Quix state/changelogs healthy |
-| Postgres | Managed; Alembic in CI/CD |
-| Redis | Managed **for UI cache only**; optional if single UI + acceptable DB load |
-| UI | Auth proxy; scale horizontally with shared Redis |
-| Images | `Dockerfile.pipeline` / `Dockerfile.ui`; pin digests |
-
----
-
-## 10. Module map
+## Appendix B — Module map
 
 ```
 src/alert_pipeline/
   main.py
-  config.py
-  alert_config.py
-  schemas.py
-  metrics.py
+  config.py                 # env / Settings
+  alert_config.py           # YAML load + merge
+  schemas.py                # LogEvent, AlertEvent, statuses
+  metrics.py                # TTA/TTR helpers (not Prometheus)
   sample_producer.py
   ui_cache_invalidate.py
   dedup/
     fingerprint.py
-    quix_state.py       # production window/refire (Quix State)
-    engine.py           # in-process (tests)
-    store.py            # memory store helper (tests; redis-dedup deprecated)
+    quix_state.py           # production window/refire (Quix State)
+    engine.py               # in-process DedupEngine — tests only
+    store.py                # memory store helper — tests only
+                            # (Redis-as-dedup path removed / rejected)
   processing/
-    handler.py          # emit_alert / test handle_event
+    handler.py              # emit_alert / test handle_event
   runtime/
-    quix_runtime.py     # only stream runtime
+    quix_runtime.py         # only stream runtime
     factory.py
   db/
     models.py, repository.py
-  dispatchers/
+  dispatchers/              # Zenduty, Teams, webhook + registry
   cache/
-    alert_cache.py      # UI Redis
-  ui/
+    alert_cache.py          # UI Redis snapshot
+  ui/                       # FastAPI app + static assets
 config/alerts.yaml
 alembic/
-docs/HLD.md             # this document
-tests/
+docs/HLD.md                 # this document
+docs/images/                # e.g. operator-ui screenshot assets
+tests/                      # includes test_quix_dedup_state.py as state contract
 ```
 
 ---
 
-## 11. Design principles
+## Appendix C — Glossary
 
-1. **One stream runtime (Quix)** — no dual Flink path to maintain.
-2. **Dedup co-located with stream keys** — `group_by(fingerprint)` + Quix state, not an external cache.
-3. **Postgres is operator truth** — ack/resolve, TTA/TTR, widgets, audit.
-4. **Redis is a UI performance tool** — never required for emit/suppress correctness.
-5. **Policy in YAML** — windows and fingerprint fields without code changes.
-6. **Dispatch is pluggable and audited** — subclass + registry + `dispatch_log`.
-7. **Demo defaults ≠ production secrets** — required env for DB credentials.
-
----
-
-## 12. Open decisions (remaining)
-
-| Topic | Options | Notes |
-| --- | --- | --- |
-| Notification reliability | Sync (today) vs outbox | Outbox reduces consumer stall |
-| Auth for UI | None / reverse proxy / OIDC | Required off private networks |
-| Ingress Kafka key | None vs pre-set fingerprint | `group_by` already re-keys; optional optimization |
-| Postgres-assisted counts | Emit-only counts vs update DB every event | Accuracy vs write load |
-
-**Closed decisions (see §2):** Quix-only runtime; no Redis dedup; no Flink.
+| Term | Meaning |
+| --- | --- |
+| **Fingerprint** | Stable hash key grouping “same” errors for one window |
+| **Incident / alert row** | Operator-visible SoR entity in Postgres |
+| **Window** | Idle timeout after which state treats the next event as new |
+| **Refire** | Periodic re-emit/update while the window stays active |
+| **SoR** | System of record (Postgres for operators) |
+| **DLQ** | Dead-letter queue for unparseable ingress |
+| **TTA / TTR** | Time to acknowledge / time to resolve (operator SLIs) |
 
 ---
 
-*Last updated for Quix keyed-state dedup, Flink removal, and Redis-as-UI-cache-only. Keep this document aligned with `runtime/quix_runtime.py` and `dedup/quix_state.py`.*
+*Version 0.3.0 — current-system-first HLD with guarantees, lifecycle, scaling, and ADRs in the appendix. Update this document when runtime, state, or SoR semantics change.*

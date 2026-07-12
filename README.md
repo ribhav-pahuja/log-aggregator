@@ -21,21 +21,21 @@ Repository: [github.com/ribhav-pahuja/log-aggregator](https://github.com/ribhav-
               │  Quix Streams (Dockerfile.pipeline)         │
               │  1. parse / min-level                       │
               │  2. group_by(fingerprint)                   │
-              │  3. keyed-state dedup (window + refire)     │
-              │  4. emit → Postgres + dispatch              │
+              │  3. keyed-state dedup (event-time window)   │
+              │  4. emit → Postgres + outbox enqueue        │
               └─────────────────────┬─────────────────────┘
                                     │
           ┌─────────────────────────┼─────────────────────────┐
           ▼                         ▼                         ▼
-    PostgreSQL              Zenduty / Teams              Operator UI
-    alerts (+ Alembic)      generic webhook              Dockerfile.ui
-    dispatch_log            (pluggable)                  FastAPI :8000
-    dashboard_widgets                                      │ reads / invalidate
-                                                           ▼
+    PostgreSQL              dispatch worker              Operator UI
+    alerts (+ Alembic)      (outbox → Zenduty/           Dockerfile.ui
+    dispatch_outbox         Teams / webhook)             FastAPI :8000
+    dispatch_log                                           │ /metrics
+    dashboard_widgets                                      ▼
                                                     Redis: UI snapshot cache only
 ```
 
-**Core idea:** **Dedup** runs in **Quix keyed state** (`group_by` + per-fingerprint state). `AlertProcessor` **persists** incidents and **dispatches** notifications. **Redis is only the UI read cache** (not used for dedup).
+**Core idea:** **Dedup** runs in **Quix keyed state** (`group_by` + per-fingerprint state, **event-time** windows). `AlertProcessor` **persists** incidents and **enqueues** notifications to `dispatch_outbox`. A separate **`alert-dispatch-worker`** drains the outbox (idempotent per channel). **Redis is only the UI read cache** (not used for dedup).
 
 **HLD:** [`docs/HLD.md`](docs/HLD.md)
 
@@ -64,10 +64,11 @@ docker compose --profile demo up -d
 | --- | --- | --- |
 | `kafka` | Log ingress (auto-create topics **disabled**) | `9092` host / `kafka:29092` in-network |
 | `kafka-init` | Creates `logs` + `logs-dlq` | — |
-| `postgres` | Alerts, dispatch audit, **shared widgets** (Alembic on boot) | `5432` |
+| `postgres` | Alerts, outbox, dispatch audit, **shared widgets** (Alembic on boot) | `5432` |
 | `redis` | **UI read cache only** (not pipeline dedup) | `6379` |
-| `alert-pipeline` | Dedup + DB + dispatch (`Dockerfile.pipeline`) | — |
-| `alert-ui` | Operator UI + APIs (`Dockerfile.ui`) | **8000** |
+| `alert-pipeline` | Dedup + DB + outbox enqueue (`Dockerfile.pipeline`) | — |
+| `alert-dispatch-worker` | Drains `dispatch_outbox` → Zenduty/Teams/webhook | — |
+| `alert-ui` | Operator UI + APIs + `/metrics` (`Dockerfile.ui`) | **8000** |
 | `webhook-debug` | Echo sink (opt-in via `DISPATCH_WEBHOOK_ENABLED`) | `8080` |
 | `log-producer` | Demo traffic (`--profile demo`) | — |
 
@@ -85,11 +86,12 @@ docker compose --profile demo down -v
 ### Behaviour
 
 1. Only logs at or above the configured **min level** (default `ERROR`, from YAML / env) become incidents.
-2. Events sharing the same **fingerprint** within **`dedup_window_seconds`** collapse into one active incident (`occurrence_count` increases in Quix state; DB updates on emit).
-3. Optional **refire** every **`refire_interval_seconds`** can emit an `updated` notification (and dispatch), unless suppressed while **acknowledged**.
-4. After the window with no events, Quix per-key state is treated as expired; the next match can open a **new** incident.
-5. **Host is not in the default fingerprint** (fleet-wide collapse). Add `host` in `dedup_fields` if you need per-node incidents.
-6. **Quix co-locates fingerprints** via `group_by` (creates internal `repartition__*` / changelog topics). **Redis is not used for dedup** — only for the operator UI snapshot cache.
+2. Events sharing the same **fingerprint** within **`dedup_window_seconds`** (measured in **event time**, not wall-clock) collapse into one active incident.
+3. Optional **refire** every **`refire_interval_seconds`** (event-time) can emit an `updated` notification, unless suppressed while **acknowledged**.
+4. After the window with no events, Quix per-key state is treated as expired; the next match can open a **new** incident (unless `allow_reopen_after_resolve: false` and a resolved row still exists).
+5. **Host is not in the default fingerprint** (fleet-wide collapse). Choose fields per service / error_code in `config/alerts.yaml`.
+6. **Quix co-locates fingerprints** via `group_by`. **Redis is not used for dedup** — only for the operator UI snapshot cache.
+7. On emit: Postgres upsert + **outbox enqueue**; `alert-dispatch-worker` sends notifications with idempotency keys `{alert_id}:{channel}:{occurrence_count}`.
 
 ### Configurable fingerprint fields (`config/alerts.yaml`)
 

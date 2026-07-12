@@ -45,12 +45,32 @@ def log_event_from_wire(data: dict[str, Any]) -> LogEvent:
     return LogEvent.model_validate(data)
 
 
+# Max how far ahead of wall-clock an event timestamp may be before we clamp.
+_MAX_FUTURE_SKEW_SECONDS = 300.0
+
+
+def _event_clock(event: LogEvent, *, now: float | None = None) -> float:
+    """Event-time for window/refire. ``now`` overrides (tests). Clamps far-future skew."""
+    if now is not None:
+        return float(now)
+    et = event.timestamp.timestamp() if event.timestamp else time.time()
+    wall = time.time()
+    if et > wall + _MAX_FUTURE_SKEW_SECONDS:
+        logger.warning(
+            "Event timestamp far in the future (%.0fs); clamping to wall-clock",
+            et - wall,
+        )
+        return wall
+    return et
+
+
 def build_enrichment(
     event: LogEvent,
     *,
     window_seconds: int,
     refire_interval_seconds: int,
     suppress_dispatch_while_acknowledged: bool,
+    allow_reopen_after_resolve: bool = True,
     dedup_fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Serializable row for Quix (must include fingerprint for group_by)."""
@@ -60,9 +80,8 @@ def build_enrichment(
         "event": log_event_to_wire(event),
         "window_seconds": int(window_seconds),
         "refire_interval_seconds": int(refire_interval_seconds),
-        "suppress_dispatch_while_acknowledged": bool(
-            suppress_dispatch_while_acknowledged
-        ),
+        "suppress_dispatch_while_acknowledged": bool(suppress_dispatch_while_acknowledged),
+        "allow_reopen_after_resolve": bool(allow_reopen_after_resolve),
         "title": build_title(event),
     }
 
@@ -76,23 +95,28 @@ def process_enriched_with_state(
     """
     Apply window / refire rules using Quix per-key state.
 
+    Windows and refire use **event time** (``event.timestamp``), not processing
+    wall-clock, so delayed/out-of-order logs keep consistent window semantics.
+    Pass ``now`` only in tests to inject a clock.
+
     Returns a wire dict for the sink step, or None if suppressed.
     """
-    now_ts = time.time() if now is None else now
     event = log_event_from_wire(row["event"])
+    event_ts = _event_clock(event, now=now)
     fingerprint = row["fingerprint"]
     window = max(1, int(row.get("window_seconds") or 300))
     refire = max(0, int(row.get("refire_interval_seconds") or 60))
     title = row.get("title") or build_title(event)
     suppress_ack = bool(row.get("suppress_dispatch_while_acknowledged", True))
+    allow_reopen = bool(row.get("allow_reopen_after_resolve", True))
 
     raw = state.get(_STATE_KEY)
     existing: dict[str, Any] | None = raw if isinstance(raw, dict) else None
 
     if existing is not None:
         last_seen = _iso_to_dt(existing["last_seen"])
-        if now_ts - last_seen.timestamp() > float(existing.get("window_seconds") or window):
-            # Window expired — treat as brand-new incident
+        if event_ts - last_seen.timestamp() > float(existing.get("window_seconds") or window):
+            # Window expired (event-time) — treat as brand-new incident
             existing = None
             try:
                 state.delete(_STATE_KEY)
@@ -107,7 +131,7 @@ def process_enriched_with_state(
             "first_seen": _dt_to_iso(event.timestamp),
             "last_seen": _dt_to_iso(event.timestamp),
             "occurrence_count": 1,
-            "last_emitted_at": now_ts,
+            "last_emitted_at": event_ts,
             "severity": event.level.value,
             "service": event.service,
             "host": event.host,
@@ -120,7 +144,7 @@ def process_enriched_with_state(
         }
         state.set(_STATE_KEY, st)
         logger.info(
-            "New incident fingerprint=%s service=%s window=%ss backend=quix",
+            "New incident fingerprint=%s service=%s window=%ss backend=quix event_time",
             fingerprint,
             event.service,
             window,
@@ -128,6 +152,7 @@ def process_enriched_with_state(
         return {
             "alert": _alert_wire_from_state(st, is_new=True, description=event.message),
             "suppress_dispatch_while_acknowledged": suppress_ack,
+            "allow_reopen_after_resolve": allow_reopen,
         }
 
     # Update existing window
@@ -147,28 +172,25 @@ def process_enriched_with_state(
         existing["severity"] = event.level.value
 
     last_em = float(existing.get("last_emitted_at") or 0)
-    if (now_ts - last_em) < refire:
+    if (event_ts - last_em) < refire:
         state.set(_STATE_KEY, existing)
         logger.debug(
-            "Suppressed duplicate fingerprint=%s count=%s (quix state)",
+            "Suppressed duplicate fingerprint=%s count=%s (quix state, event-time)",
             fingerprint,
             existing["occurrence_count"],
         )
         return None
 
-    existing["last_emitted_at"] = now_ts
+    existing["last_emitted_at"] = event_ts
     state.set(_STATE_KEY, existing)
     return {
-        "alert": _alert_wire_from_state(
-            existing, is_new=False, description=event.message
-        ),
+        "alert": _alert_wire_from_state(existing, is_new=False, description=event.message),
         "suppress_dispatch_while_acknowledged": suppress_ack,
+        "allow_reopen_after_resolve": allow_reopen,
     }
 
 
-def _alert_wire_from_state(
-    st: dict[str, Any], *, is_new: bool, description: str
-) -> dict[str, Any]:
+def _alert_wire_from_state(st: dict[str, Any], *, is_new: bool, description: str) -> dict[str, Any]:
     sev = st.get("severity") or "ERROR"
     try:
         severity = LogLevel(sev)

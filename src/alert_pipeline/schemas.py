@@ -84,7 +84,9 @@ class LogEvent(BaseModel):
     @classmethod
     def from_kafka_value(cls, payload: dict[str, Any]) -> "LogEvent":
         """Best-effort parse of heterogeneous log shapes."""
-        level = payload.get("level") or payload.get("severity") or payload.get("log_level") or "INFO"
+        level = (
+            payload.get("level") or payload.get("severity") or payload.get("log_level") or "INFO"
+        )
         message = (
             payload.get("message")
             or payload.get("msg")

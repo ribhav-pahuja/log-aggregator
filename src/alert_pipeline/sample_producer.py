@@ -34,7 +34,9 @@ ERROR_CODES = ["DB_CONN", "GW_TIMEOUT", "NPE", "RATE_LIMIT", "DISK_FULL", None]
 
 def main() -> None:
     settings = get_settings()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout
+    )
 
     producer = Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
     topic = settings.kafka_input_topic
