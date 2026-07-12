@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | **Status** | Living document |
-| **Version** | 0.4.0 |
+| **Version** | 0.4.1 |
 | **Last updated** | 2026-07-12 |
 | **Audience** | Engineers owning ingress, reliability, or on-call tooling |
 | **Related** | [README](../README.md), [Runtime notes](../src/alert_pipeline/runtime/README.md), [alerts.yaml](../config/alerts.yaml) |
@@ -21,11 +21,12 @@
 
 | Version | Date | What changed |
 | --- | --- | --- |
+| 0.4.1 | 2026-07-12 | Align architecture diagrams with outbox worker; atomic upsert+enqueue; shared dedup transition |
 | 0.4.0 | 2026-07-12 | Async outbox dispatch + worker; event-time windows; allow_reopen DB check; Prometheus `/metrics`; dual CI |
 | 0.3.0 | 2026-07-08 | Restructure: current system first; data model, guarantees, scaling, security, ops signals; ADRs demoted to appendix |
 | 0.2.0 | — | Quix keyed-state dedup; Flink removal; Redis as UI cache only |
 
-**Keep aligned with:** `runtime/quix_runtime.py`, `dedup/quix_state.py`, `processing/handler.py`, `config/alerts.yaml`.
+**Keep aligned with:** `runtime/quix_runtime.py`, `dedup/quix_state.py`, `dedup/transition.py`, `processing/handler.py`, `dispatchers/outbox_worker.py`, `config/alerts.yaml`.
 
 ---
 
@@ -37,7 +38,7 @@ Turn a high-volume stream of application **error logs** into a small number of d
 2. **Notify** humans and systems (Zenduty, Teams, webhooks, …).
 3. **Operate** them from a shared dashboard (ack / resolve, TTA/TTR, label widgets).
 
-The pipeline is a **Python-native Quix Streams** application: Kafka consume → fingerprint co-location → keyed-state dedup → Postgres + dispatch. The operator UI is a **separate** FastAPI process with an optional **Redis read cache**.
+The pipeline is a **Python-native Quix Streams** application: Kafka consume → fingerprint co-location → keyed-state dedup → **Postgres upsert + outbox enqueue** (one transaction). A separate **`alert-dispatch-worker`** drains the outbox to Zenduty / Teams / webhooks. The operator UI is another FastAPI process with an optional **Redis read cache**.
 
 ### 1.1 Goals
 
@@ -65,58 +66,70 @@ The pipeline is a **Python-native Quix Streams** application: Kafka consume → 
 | False-merge rate | Over-broad fingerprints hide distinct failures (tune `dedup_fields`) |
 | MTTA / TTA, TTR | Operator speed; stored on incident rows when acked/resolved |
 | Dispatch reliability | Successful channel attempts vs audited failures under load |
-| Pipeline health | Consumer lag, DLQ growth, emit-path errors (Postgres / dispatch stall) |
+| Pipeline health | Consumer lag, DLQ growth, outbox backlog, emit-path DB errors |
 
 ---
 
 ## 2. Architecture at a glance
 
-Two **deployable units** share Postgres (and optionally Redis for the UI):
+**Three** app processes share Postgres (and optionally Redis for the UI):
 
 ```
   Producers (apps, agents, log shippers)
            │
            ▼
-     ┌───────────┐     ┌──────────────────────────────────────┐
-     │  Kafka    │     │  alert-pipeline (Quix Streams)         │
-     │  logs     │────►│  parse → min-level → fingerprint       │
-     │  logs-dlq │     │  group_by(fp) → keyed-state dedup      │
-     └───────────┘     │  emit → Postgres + dispatch + invalidate│
-                       └───────────┬──────────────────┬─────────┘
-                                   │                  │
-                    ┌──────────────▼──────┐   ┌───────▼────────────┐
-                    │  PostgreSQL (SoR)   │   │  Zenduty / Teams / │
-                    │  alerts             │   │  webhooks          │
-                    │  dispatch_log       │   └────────────────────┘
-                    │  dashboard_widgets  │
-                    └──────────────▲──────┘
-                                   │ read / write (ack, resolve)
-                       ┌───────────┴──────────────────┐
-                       │  alert-ui (FastAPI :8000)      │
-                       │  list, stats, widgets, demo    │
-                       │  Redis: UI snapshot cache only │
-                       └────────────────────────────────┘
+     ┌───────────┐     ┌──────────────────────────────────────────┐
+     │  Kafka    │     │  alert-pipeline (Quix Streams)             │
+     │  logs     │────►│  parse → min-level → fingerprint           │
+     │  logs-dlq │     │  group_by(fp) → keyed-state dedup          │
+     └───────────┘     │  emit → Postgres upsert + outbox (1 txn)   │
+                       │       → UI cache invalidate (best-effort)  │
+                       └──────────────────┬───────────────────────┘
+                                          │ write SoR + dispatch_outbox
+                                          ▼
+                       ┌──────────────────────────────────────────┐
+                       │  PostgreSQL (system of record)             │
+                       │  alerts · dispatch_outbox · dispatch_log   │
+                       │  dashboard_widgets                         │
+                       └─────┬──────────────────────────▲─────────┘
+                             │ claim / mark sent        │ read / write
+                             ▼                          │ (ack, resolve)
+              ┌──────────────────────────┐   ┌──────────┴───────────────┐
+              │  alert-dispatch-worker   │   │  alert-ui (FastAPI :8000)  │
+              │  drain outbox → HTTP     │   │  list, stats, widgets      │
+              └────────────┬─────────────┘   │  Redis: UI snapshot only   │
+                           │                 └────────────────────────────┘
+                           ▼
+              ┌──────────────────────────┐
+              │  Zenduty / Teams /       │
+              │  webhooks (+ audit log)  │
+              └──────────────────────────┘
 ```
+
+**HTTP to notification channels never runs on the Quix sink path** (default `DISPATCH_MODE=outbox`). The pipeline only enqueues work; the worker performs side-effects.
 
 ### 2.1 Decision stack (one view)
 
 ```
   Kafka transport     →  Quix Streams
   Fingerprint co-loc  →  group_by(fingerprint)
-  Window / refire     →  Quix per-key state
-  Incident truth      →  Postgres
+  Window / refire     →  Quix per-key state (rules in transition.py)
+  Incident truth      →  Postgres (alerts)
+  Notify reliability  →  dispatch_outbox + alert-dispatch-worker
+  Notify audit        →  dispatch_log + idempotency keys
   UI poll performance →  Redis snapshot cache
-  Notifications       →  pluggable HTTP + dispatch_log
   Flink / Redis-dedup →  rejected (see Appendix A)
 ```
 
 | Concern | Owner |
 | --- | --- |
 | Active window / suppress / refire | **Quix state** |
-| Incidents, ack/resolve, TTA/TTR, audit | **Postgres** |
+| Incidents, ack/resolve, TTA/TTR, widgets | **Postgres** |
+| Pending notifications | **`dispatch_outbox`** (filled by pipeline, drained by worker) |
+| Channel HTTP + retries | **`alert-dispatch-worker`** |
 | Multi-instance UI list/stats | **Redis** (optional; not on emit correctness path) |
 
-**Core idea:** Dedup co-locates with stream keys. Redis must never be the second brain for “is this fingerprint active?”
+**Core idea:** Dedup co-locates with stream keys. Redis must never be the second brain for “is this fingerprint active?” Notifications are asynchronous and audited, not inline on consume.
 
 ---
 
@@ -245,27 +258,29 @@ Default fields: `service`, `level`, `labels`, `message` (**host excluded** for f
 
 ## 5. Components and processing path
 
-### 5.1 Layered view (two processes)
+### 5.1 Layered view (three processes)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Presentation (alert-ui)                                          │
 │  Static assets + FastAPI REST (list, stats, ack/resolve,         │
-│  widgets, demo fire)                                              │
+│  widgets, demo fire) · GET /metrics                               │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │ reads via AlertReadCache (Redis)
 ┌───────────────────────────────▼─────────────────────────────────┐
-│  Application services                                             │
-│  • Quix runtime (alert-pipeline): enrich → group_by → state → emit│
-│  • AlertProcessor.emit_alert (Postgres + outbox + UI invalidate)  │
-│  • Dispatch worker + DispatchFanout + pluggable channels          │
+│  Application services (three deployables)                         │
+│  • alert-pipeline (Quix): enrich → group_by → state → emit        │
+│  • AlertProcessor.emit_alert: reopen policy → upsert+outbox txn   │
+│    → UI cache invalidate (after commit)                           │
+│  • alert-dispatch-worker: claim outbox → DispatchFanout → HTTP    │
 │  • AlertRepository (CRUD + upsert + outbox + audit)               │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼─────────────────────────────────┐
 │  Domain                                                           │
 │  • Fingerprint (configurable fields)                              │
-│  • quix_state window/refire transitions                           │
+│  • transition.apply_dedup_transition (shared rules)               │
+│  • quix_state / DedupEngine adapters                              │
 │  • AlertEvent / LogEvent schemas, severity ranking                │
 │  • YAML alert config (defaults ← service ← error_code)            │
 └───────────────────────────────┬─────────────────────────────────┘
@@ -273,9 +288,9 @@ Default fields: `service`, `level`, `labels`, `message` (**host excluded** for f
 ┌───────────────────────────────▼─────────────────────────────────┐
 │  Infrastructure                                                   │
 │  • Quix Streams + Kafka (ingress, repartition, changelog, DLQ)    │
-│  • PostgreSQL (+ Alembic)                                         │
+│  • PostgreSQL (+ Alembic): alerts, dispatch_outbox, dispatch_log  │
 │  • Redis (UI snapshot only)                                       │
-│  • httpx + tenacity (outbound dispatch)                           │
+│  • httpx + tenacity (outbound dispatch on worker only)            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -288,14 +303,15 @@ Kafka(logs)
   → build fingerprint + enrichment row
   → group_by(fingerprint)          # co-locate same incident key
   → stateful process_enriched_with_state()
-        new | suppress | refire update
+        (apply_dedup_transition → new | suppress | update)
   → on emit: AlertProcessor.emit_alert()
         1. allow_reopen policy check (DB status)
-        2. upsert Postgres
-        3. invalidate UI Redis snapshot (optional)
-        4. enqueue dispatch_outbox per channel (idempotency_key)
-           (skip if refire + acked + suppress_dispatch_while_acknowledged)
-  → alert-dispatch-worker claims outbox → HTTP + dispatch_log
+        2. ONE transaction: upsert alerts + enqueue dispatch_outbox
+           (skip enqueue if refire + acked + suppress_dispatch_while_acknowledged)
+        3. invalidate UI Redis snapshot (optional, after commit)
+  → alert-dispatch-worker
+        claim outbox (SKIP LOCKED + CAS) → HTTP channel → dispatch_log
+        → sent | failed (backoff) | dead
 ```
 
 ### 5.3 Ingress contract (Kafka)
@@ -332,20 +348,34 @@ Unit tests: `tests/test_quix_dedup_state.py`, `tests/test_event_time.py`, `tests
 
 - **`emit_alert`**: production path after Quix state decides to emit.
 - **`handle_event`**: in-process engine for tests only.
-- Order on emit: **reopen policy → Postgres upsert → optional Redis invalidate → outbox enqueue** (or `DISPATCH_MODE=inline` for sync fan-out).
+- Order on emit (outbox mode):
+  1. Reopen policy (optional skip).
+  2. **`upsert_and_maybe_enqueue`** — one Postgres transaction (incident + outbox).
+  3. UI cache invalidate (best-effort, **after** commit).
+- `DISPATCH_MODE=inline` (tests / simple demos only): upsert alone, then sync fan-out HTTP on the emit path (not recommended for production).
 
 ### 5.6 Dispatch (outbox + worker)
 
 Default **`DISPATCH_MODE=outbox`**:
 
+```
+  alert-pipeline                         alert-dispatch-worker
+  ─────────────                          ─────────────────────
+  emit_alert                             loop:
+    └─ txn:                              1. claim due rows
+         INSERT/UPDATE alerts              (FOR UPDATE SKIP LOCKED + CAS)
+         INSERT dispatch_outbox          2. HTTP via DispatchFanout
+           (per channel)                 3. write dispatch_log
+    └─ commit                            4. mark sent | failed | dead
+    └─ invalidate Redis (optional)
+```
+
 1. Emit path inserts one `dispatch_outbox` row per enabled channel with  
-   `idempotency_key = {alert_id}:{channel}:{occurrence_count}` (unique).
+   `idempotency_key = {alert_id}:{channel}:{occurrence_count}` (unique), **in the same transaction as the alert upsert**.
 2. **`alert-dispatch-worker`** claims due rows (`pending`/`failed`) multi-worker-safely (`FOR UPDATE SKIP LOCKED` on Postgres + compare-and-swap status transition), calls the channel, writes `dispatch_log`, marks `sent` / retries with backoff / `dead` after max attempts.
 3. Reprocessing that re-enqueues the same key is a no-op; worker also skips if audit already has a successful row for that key.
 
-`DISPATCH_MODE=inline` keeps legacy sync fan-out on the emit path (tests / simple demos only).
-
-Channel HTTP still uses **tenacity** inside each dispatcher. Payload: `AlertEvent.to_dispatch_dict()`.
+Channel HTTP uses **tenacity** inside each dispatcher. Payload: `AlertEvent.to_dispatch_dict()`.
 
 ### 5.7 Operator UI and Redis (read path only)
 
@@ -417,7 +447,9 @@ Producer → Kafka(logs) → Quix enrich → group_by(fp)
 
 ```
 … → state: emit updated (same alert_id, count++)
-  → repo.upsert UPDATE → maybe suppress if acknowledged → else dispatch
+  → repo.upsert+outbox (one txn); skip enqueue if acknowledged + suppress
+  → UI cache invalidate
+  → worker → channels (if enqueued)
 ```
 
 #### Operator acknowledge
@@ -461,7 +493,7 @@ Instance A writes Postgres + invalidate
 | Redis down | UI degrades (DB / local fallback); **pipeline dedup continues** |
 | Downstream webhook 5xx | Retries then audit failure; incident remains |
 | Pipeline restart | State recovery; upsert protects counts; possible re-notify |
-| Extreme ERROR flood | Sync dispatch + DB emit pressure; lag grows (see §11) |
+| Extreme ERROR flood | Outbox backlog + DB emit pressure; lag grows (see §11). Scale workers; HTTP is off the Quix path |
 
 ---
 
