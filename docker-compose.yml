@@ -225,8 +225,8 @@ services:
       WAIT_FOR_KAFKA: "1"
       WAIT_FOR_POSTGRES: "0"
       RUN_MIGRATIONS: "0"
-      # Dummy URL so entrypoint does not require DB for the producer
-      DATABASE_URL: sqlite+pysqlite:////tmp/producer.db
+      # Producer only needs Kafka; URL satisfies Settings validation if loaded
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
     command: ["log-producer"]
     restart: unless-stopped
     networks:

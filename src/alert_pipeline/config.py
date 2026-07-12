@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     #   unit tests → in-process MemoryDedupStore (DedupEngine)
     # DEDUP_BACKEND was removed (see _reject_removed_dedup_backend).
 
-    database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
+    # PostgreSQL only (SQLAlchemy + psycopg). SQLite is not supported.
+    database_url: str = "postgresql+psycopg://alerts:alerts@localhost:5432/alerts"
 
     dispatch_enabled: bool = True
     # outbox = enqueue on emit path + separate worker (default, production)
@@ -94,6 +95,28 @@ class Settings(BaseSettings):
         if name in ("quixstreams",):
             return "quixstreams"
         return name
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _require_postgres(cls, v: object) -> str:
+        url = str(v or "").strip()
+        if not url:
+            raise ValueError(
+                "DATABASE_URL is required "
+                "(e.g. postgresql+psycopg://alerts:alerts@localhost:5432/alerts)"
+            )
+        low = url.lower()
+        if "sqlite" in low:
+            raise ValueError(
+                "SQLite is not supported. Use PostgreSQL, e.g. "
+                "postgresql+psycopg://alerts:alerts@localhost:5432/alerts "
+                "(Compose: host `postgres`, host processes: `localhost`)."
+            )
+        if not low.startswith("postgresql"):
+            raise ValueError(
+                f"DATABASE_URL must be a PostgreSQL URL (postgresql+psycopg://...), got {url!r}"
+            )
+        return url
 
     @model_validator(mode="after")
     def _reject_removed_dedup_backend(self) -> Self:

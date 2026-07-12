@@ -307,7 +307,7 @@ See [`.env.example`](.env.example). Important variables:
 | --- | --- | --- |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Brokers |
 | `KAFKA_INPUT_TOPIC` | `logs` | Source topic |
-| `DATABASE_URL` | SQLite tmp / Compose Postgres | SQLAlchemy URL |
+| `DATABASE_URL` | Postgres (required) | `postgresql+psycopg://…` — **no SQLite** |
 | `REDIS_URL` | `redis://localhost:6379/0` | UI shared cache |
 | `UI_CACHE_TTL_SECONDS` | `10` | Snapshot TTL |
 | `ALERT_CONFIG_PATH` | `config/alerts.yaml` | Dedup / refire YAML |
@@ -351,6 +351,8 @@ tests/
 python -m venv .venv && source .venv/bin/activate   # 3.11+
 pip install -e ".[dev,pipeline,ui]"
 
+# Postgres must be running (Compose: docker compose up -d postgres)
+export TEST_DATABASE_URL=postgresql+psycopg://alerts:alerts@localhost:5432/alerts
 pytest -q
 # Cache / stampede / pagination:
 pytest -q tests/test_alert_cache.py

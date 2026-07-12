@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from alert_pipeline.alert_config import get_alert_config
 from alert_pipeline.cache.alert_cache import AlertReadCache, CachedAlert, CachedDispatch
 from alert_pipeline.config import get_settings
-from alert_pipeline.db.models import AlertRecord, Base, WidgetRecord
+from alert_pipeline.db.models import AlertRecord, WidgetRecord
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
 from alert_pipeline.metrics import apply_status_timestamps
@@ -276,7 +276,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        Base.metadata.create_all(repo._engine)  # noqa: SLF001
+        # Schema: Alembic (entrypoint RUN_MIGRATIONS=1). Do not create_all here.
         cache.start()
         logger.info(
             "UI Redis cache started ttl=%ss url=%s",

@@ -53,7 +53,6 @@ def upgrade() -> None:
         ["fingerprint"],
         unique=True,
         postgresql_where=sa.text("status IN ('open', 'updated', 'acknowledged')"),
-        sqlite_where=sa.text("status IN ('open', 'updated', 'acknowledged')"),
     )
 
     op.create_table(

@@ -209,7 +209,7 @@ Related tables:
 | `dispatch_log` | Per-channel attempt audit (success, status_code, error, optional idempotency_key) |
 | `dashboard_widgets` | Shared UI label filters |
 
-Schema: **Alembic** (`alembic upgrade head` on entrypoint) + idempotent `create_all` fallback for tests/sqlite.
+Schema: **Alembic only** (`alembic upgrade head` on entrypoint). **PostgreSQL is required** — SQLite is not supported.
 
 ### 4.4 Status lifecycle
 
@@ -505,7 +505,7 @@ Instance A writes Postgres + invalidate
 | --- | --- | --- |
 | Env / `.env` / Compose | Kafka, `DATABASE_URL`, Redis UI URL, dispatch enable flags, secrets | Process restart typically required |
 | YAML (`config/alerts.yaml`) | Dedup fields, windows, min level, per-service / error_code overrides | Path via `ALERT_CONFIG_PATH`; treat reload as restart-safe unless explicitly hot-reloaded |
-| Code defaults | Pydantic `Settings` (sqlite only for unit tests) | Never rely on demo defaults for prod secrets |
+| Code defaults | Pydantic `Settings` (local Postgres default URL) | Never rely on demo defaults for prod secrets |
 
 ### 7.2 YAML merge order
 

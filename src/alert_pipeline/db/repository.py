@@ -16,7 +16,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from alert_pipeline.db.models import (
     AlertRecord,
-    Base,
     DispatchLog,
     DispatchOutbox,
     WidgetRecord,
@@ -37,41 +36,32 @@ _ACTIVE_FP_WHERE = "status IN ('open', 'updated', 'acknowledged')"
 
 class AlertRepository:
     def __init__(self, database_url: str) -> None:
-        connect_args: dict = {}
-        if database_url.startswith("sqlite"):
-            # Multi-thread workers (tests / single-file demos) need a lock wait,
-            # not immediate "database is locked" failures.
-            connect_args["check_same_thread"] = False
-            connect_args["timeout"] = 30
-        self._engine = create_engine(database_url, future=True, connect_args=connect_args)
+        if "sqlite" in (database_url or "").lower():
+            raise ValueError(
+                "SQLite is not supported. Use PostgreSQL "
+                "(postgresql+psycopg://user:pass@host:5432/db)."
+            )
+        if not (database_url or "").lower().startswith("postgresql"):
+            raise ValueError(f"DATABASE_URL must be PostgreSQL, got {database_url!r}")
+        self._engine = create_engine(database_url, future=True, pool_pre_ping=True)
         self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
-        # Bootstrap for tests / first boot. Production should prefer Alembic
-        # (`alembic upgrade head`); create_all is idempotent and safe alongside it.
-        Base.metadata.create_all(self._engine)
-        self._ensure_active_fingerprint_index(database_url)
+        # Schema is owned by Alembic (`alembic upgrade head` on boot / in tests).
+        # Ensure partial unique index exists on older DBs that pre-date migrations.
+        self._ensure_active_fingerprint_index()
         logger.info(
             "Database ready: %s",
             database_url.split("@")[-1] if "@" in database_url else database_url,
         )
 
-    def _ensure_active_fingerprint_index(self, database_url: str) -> None:
+    def _ensure_active_fingerprint_index(self) -> None:
         """Enforce one active row per fingerprint (multi-worker safety)."""
-        is_sqlite = database_url.startswith("sqlite")
         with self._engine.begin() as conn:
-            if is_sqlite:
-                conn.execute(
-                    text(
-                        f"CREATE UNIQUE INDEX IF NOT EXISTS {_ACTIVE_FP_INDEX} "
-                        f"ON alerts (fingerprint) WHERE {_ACTIVE_FP_WHERE}"
-                    )
+            conn.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {_ACTIVE_FP_INDEX} "
+                    f"ON alerts (fingerprint) WHERE {_ACTIVE_FP_WHERE}"
                 )
-            else:
-                conn.execute(
-                    text(
-                        f"CREATE UNIQUE INDEX IF NOT EXISTS {_ACTIVE_FP_INDEX} "
-                        f"ON alerts (fingerprint) WHERE {_ACTIVE_FP_WHERE}"
-                    )
-                )
+            )
 
     @contextmanager
     def session(self) -> Iterator[Session]:
@@ -356,13 +346,11 @@ class AlertRepository:
     ) -> list[DispatchOutbox]:
         """Mark a batch of due rows as processing and return them.
 
-        Multi-worker safe:
-        * PostgreSQL — ``SELECT … FOR UPDATE SKIP LOCKED`` so concurrent workers
-          co-claim distinct rows without blocking each other.
-        * All dialects — each row is claimed with a compare-and-swap
-          ``UPDATE … WHERE status IN ('pending','failed')`` so a second
-          worker never double-processes a row already claimed (covers SQLite
-          tests and any dialect without skip-locked).
+        Multi-worker safe (PostgreSQL):
+        * ``SELECT … FOR UPDATE SKIP LOCKED`` so concurrent workers co-claim
+          distinct rows without blocking each other.
+        * Compare-and-swap ``UPDATE … WHERE status IN ('pending','failed')`` so a
+          second worker never double-processes a row already claimed.
         """
         now = datetime.now(timezone.utc)
         stale_before = now - timedelta(seconds=stale_processing_seconds)
@@ -385,11 +373,8 @@ class AlertRepository:
                 )
                 .order_by(DispatchOutbox.next_attempt_at, DispatchOutbox.id)
                 .limit(batch_size)
+                .with_for_update(skip_locked=True)
             )
-            # SKIP LOCKED is Postgres-specific; SQLAlchemy may emit invalid SQL
-            # on SQLite if skip_locked=True is set unconditionally.
-            if self._engine.dialect.name == "postgresql":
-                candidate_q = candidate_q.with_for_update(skip_locked=True)
 
             candidate_ids = list(session.scalars(candidate_q).all())
             if not candidate_ids:

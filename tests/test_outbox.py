@@ -36,8 +36,7 @@ def _alert(**kwargs) -> AlertEvent:
     return AlertEvent(**base)
 
 
-def test_enqueue_idempotent(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/o.db")
+def test_enqueue_idempotent(repo):
     a = _alert()
     keys1 = repo.enqueue_dispatch(a, ["webhook", "teams"])
     keys2 = repo.enqueue_dispatch(a, ["webhook", "teams"])
@@ -48,8 +47,7 @@ def test_enqueue_idempotent(tmp_path):
         assert n == 2
 
 
-def test_worker_dispatches_and_marks_sent(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/w.db")
+def test_worker_dispatches_and_marks_sent(repo, clean_db):
     a = _alert(id="aid-1", occurrence_count=3)
     repo.enqueue_dispatch(a, ["webhook"])
 
@@ -58,7 +56,7 @@ def test_worker_dispatches_and_marks_sent(tmp_path):
     mock_d.send.return_value = DispatchResult(channel="webhook", success=True, status_code=200)
     fanout = DispatchFanout([mock_d], repo=repo)
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/w.db",
+        database_url=clean_db,
         dispatch_outbox_batch_size=10,
         dispatch_outbox_max_attempts=5,
     )
@@ -73,8 +71,7 @@ def test_worker_dispatches_and_marks_sent(tmp_path):
         assert log.idempotency_key == "aid-1:webhook:3"
 
 
-def test_worker_skips_duplicate_successful_audit(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/dup.db")
+def test_worker_skips_duplicate_successful_audit(repo, clean_db):
     a = _alert(id="aid-2", occurrence_count=1)
     key = repo.make_idempotency_key(a.id, "webhook", 1)
     repo.log_dispatch(alert_id=a.id, channel="webhook", success=True, idempotency_key=key)
@@ -85,7 +82,7 @@ def test_worker_skips_duplicate_successful_audit(tmp_path):
     mock_d.send.return_value = DispatchResult(channel="webhook", success=True)
     fanout = DispatchFanout([mock_d], repo=repo)
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/dup.db",
+        database_url=clean_db,
         dispatch_outbox_max_attempts=5,
     )
     process_batch(repo, fanout, settings)
@@ -94,9 +91,9 @@ def test_worker_skips_duplicate_successful_audit(tmp_path):
         assert session.scalar(select(DispatchOutbox)).status == "sent"
 
 
-def test_processor_enqueues_outbox_not_inline(tmp_path):
+def test_processor_enqueues_outbox_not_inline(clean_db):
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/p.db",
+        database_url=clean_db,
         dispatch_enabled=True,
         dispatch_mode="outbox",
         dispatch_webhook_enabled=True,
@@ -121,9 +118,9 @@ def test_processor_enqueues_outbox_not_inline(tmp_path):
         assert rows[0].status == "pending"
 
 
-def test_reopen_disallowed_skips_emit(tmp_path):
+def test_reopen_disallowed_skips_emit(clean_db):
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/r.db",
+        database_url=clean_db,
         dispatch_enabled=False,
         ui_cache_invalidate_on_write=False,
         alert_config_path="config/alerts.yaml",
@@ -139,9 +136,9 @@ def test_reopen_disallowed_skips_emit(tmp_path):
     assert result.skipped_reason == "reopen_disallowed"
 
 
-def test_claim_outbox_batch_is_exclusive(tmp_path):
+def test_claim_outbox_batch_is_exclusive(clean_db):
     """Two sequential claims never return the same row."""
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/claim.db")
+    repo = AlertRepository(clean_db)
     for i in range(5):
         repo.enqueue_dispatch(_alert(id=f"aid-{i}", occurrence_count=i + 1), ["webhook"])
 
@@ -157,9 +154,9 @@ def test_claim_outbox_batch_is_exclusive(tmp_path):
     assert all(r.attempts == 1 for r in first + second)
 
 
-def test_concurrent_claim_outbox_no_double_claim(tmp_path):
+def test_concurrent_claim_outbox_no_double_claim(clean_db):
     """Parallel workers must not claim the same outbox row (CAS)."""
-    db_url = f"sqlite+pysqlite:///{tmp_path}/concurrent.db"
+    db_url = clean_db
     repo = AlertRepository(db_url)
     n_rows = 20
     for i in range(n_rows):
@@ -194,8 +191,7 @@ def test_concurrent_claim_outbox_no_double_claim(tmp_path):
         assert all(r.attempts == 1 for r in rows)
 
 
-def test_claim_increments_attempts_on_retry(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/retry.db")
+def test_claim_increments_attempts_on_retry(repo):
     repo.enqueue_dispatch(_alert(id="retry-1"), ["webhook"])
     claimed = repo.claim_outbox_batch(batch_size=1)
     assert len(claimed) == 1 and claimed[0].attempts == 1
@@ -221,8 +217,7 @@ def test_claim_increments_attempts_on_retry(tmp_path):
     assert claimed2[0].attempts == 2
 
 
-def test_upsert_and_maybe_enqueue_atomic_success(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/atomic.db")
+def test_upsert_and_maybe_enqueue_atomic_success(repo):
     a = _alert(id="atomic-1", fingerprint="fp-atomic")
     record, keys = repo.upsert_and_maybe_enqueue(a, ["webhook", "teams"])
     assert record.id == "atomic-1"
@@ -234,8 +229,7 @@ def test_upsert_and_maybe_enqueue_atomic_success(tmp_path):
         assert len(list(session.scalars(select(DispatchOutbox)).all())) == 2
 
 
-def test_upsert_and_maybe_enqueue_skips_when_predicate_false(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/skip.db")
+def test_upsert_and_maybe_enqueue_skips_when_predicate_false(repo):
     a = _alert(id="skip-1")
     record, keys = repo.upsert_and_maybe_enqueue(
         a,
@@ -248,9 +242,9 @@ def test_upsert_and_maybe_enqueue_skips_when_predicate_false(tmp_path):
         assert list(session.scalars(select(DispatchOutbox)).all()) == []
 
 
-def test_upsert_and_maybe_enqueue_rolls_back_on_enqueue_failure(tmp_path):
+def test_upsert_and_maybe_enqueue_rolls_back_on_enqueue_failure(clean_db):
     """If outbox insert fails mid-txn, the alert upsert must not commit."""
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/rollback.db")
+    repo = AlertRepository(clean_db)
     a = _alert(id="rb-1", fingerprint="fp-rb")
 
     original = repo._enqueue_in_session
@@ -275,10 +269,10 @@ def test_upsert_and_maybe_enqueue_rolls_back_on_enqueue_failure(tmp_path):
         assert list(session.scalars(select(DispatchOutbox)).all()) == []
 
 
-def test_processor_emit_uses_atomic_outbox(tmp_path):
+def test_processor_emit_uses_atomic_outbox(clean_db):
     """emit_alert must land alert + outbox together (no separate commits)."""
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/emit-atomic.db",
+        database_url=clean_db,
         dispatch_enabled=True,
         dispatch_mode="outbox",
         dispatch_webhook_enabled=True,

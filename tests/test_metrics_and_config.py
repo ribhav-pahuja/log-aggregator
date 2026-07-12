@@ -7,13 +7,11 @@ from pydantic import ValidationError
 from alert_pipeline.alert_config import load_alert_config
 from alert_pipeline.config import Settings
 from alert_pipeline.db.models import AlertRecord
-from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.metrics import apply_status_timestamps
 from alert_pipeline.schemas import AlertEvent, AlertStatus, LogEvent, LogLevel
 
 
-def test_tta_ttr_persisted(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/a.db")
+def test_tta_ttr_persisted(repo):
     t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
     alert = AlertEvent(
         fingerprint="fp",
@@ -48,8 +46,7 @@ def test_tta_ttr_persisted(tmp_path):
         assert r.tta_seconds == 90
 
 
-def test_set_alert_status_sets_tta(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/b.db")
+def test_set_alert_status_sets_tta(repo):
     t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
     row = repo.upsert_alert(
         AlertEvent(
@@ -104,3 +101,8 @@ def test_dedup_backend_quix_env_ignored(monkeypatch):
     monkeypatch.setenv("DEDUP_BACKEND", "quix")
     s = Settings(_env_file=None)  # type: ignore[call-arg]
     assert s.pipeline_runtime in ("quix", "quixstreams")
+
+
+def test_sqlite_database_url_rejected():
+    with pytest.raises((ValidationError, ValueError), match="SQLite is not supported"):
+        Settings(_env_file=None, database_url="sqlite+pysqlite:////tmp/x.db")  # type: ignore[call-arg]

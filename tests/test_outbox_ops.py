@@ -44,8 +44,7 @@ def _seed_dead(repo: AlertRepository, n: int = 2) -> list[int]:
     return ids
 
 
-def test_list_and_count_dead(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/ops.db")
+def test_list_and_count_dead(repo):
     _seed_dead(repo, 3)
     assert repo.count_outbox("dead") == 3
     rows = repo.list_outbox(status="dead", limit=10)
@@ -55,8 +54,7 @@ def test_list_and_count_dead(tmp_path):
     assert counts.get("dead") == 3
 
 
-def test_redrive_dead_to_pending(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/rd.db")
+def test_redrive_dead_to_pending(repo):
     ids = _seed_dead(repo, 2)
     n = repo.redrive_outbox(ids=ids[:1])
     assert n == 1
@@ -70,8 +68,7 @@ def test_redrive_dead_to_pending(tmp_path):
         assert r2 is not None and r2.status == "dead"
 
 
-def test_redrive_all_dead(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/rda.db")
+def test_redrive_all_dead(repo):
     _seed_dead(repo, 3)
     n = repo.redrive_outbox(all_matching=True, status="dead")
     assert n == 3
@@ -79,8 +76,7 @@ def test_redrive_all_dead(tmp_path):
     assert repo.count_outbox("dead") == 0
 
 
-def test_delete_dead(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/del.db")
+def test_delete_dead(repo):
     ids = _seed_dead(repo, 2)
     n = repo.delete_outbox(ids=[ids[0]])
     assert n == 1
@@ -90,12 +86,12 @@ def test_delete_dead(tmp_path):
     assert repo.count_outbox("dead") == 0
 
 
-def test_api_outbox_summary_and_redrive(tmp_path, monkeypatch):
+def test_api_outbox_summary_and_redrive(clean_db, monkeypatch):
     from fastapi.testclient import TestClient
 
     from alert_pipeline.ui import app as ui_app
 
-    db = f"sqlite+pysqlite:///{tmp_path}/api.db"
+    db = clean_db
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         database_url=db,

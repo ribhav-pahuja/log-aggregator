@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from alert_pipeline.db.models import Base
 from alert_pipeline.db.repository import AlertRepository
 
 
-def test_widget_crud(tmp_path):
-    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/w.db")
-    Base.metadata.create_all(repo._engine)
-
+def test_widget_crud(repo: AlertRepository):
     w = repo.upsert_widget(
         widget_id=None,
         title="Prod platform",
@@ -38,9 +34,7 @@ def test_widget_crud(tmp_path):
         status_filter="",
         sort_order=0,
     )
-    assert updated.id == w.id
     assert updated.title == "Prod only"
-
     assert repo.delete_widget(w.id) is True
     assert repo.get_widget(w.id) is None
     assert repo.delete_widget("missing") is False

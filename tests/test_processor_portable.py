@@ -8,9 +8,9 @@ from alert_pipeline.processing.handler import AlertProcessor, parse_log_payload
 from alert_pipeline.runtime.factory import get_runtime
 
 
-def test_processor_emits_then_dedups(tmp_path):
+def test_processor_emits_then_dedups(clean_db):
     settings = Settings(
-        database_url=f"sqlite+pysqlite:///{tmp_path}/p.db",
+        database_url=clean_db,
         dispatch_enabled=False,
         alert_config_path="config/alerts.yaml",
         ui_cache_invalidate_on_write=False,
