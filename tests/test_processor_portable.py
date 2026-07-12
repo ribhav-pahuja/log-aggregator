@@ -13,7 +13,6 @@ def test_processor_emits_then_dedups(tmp_path):
         database_url=f"sqlite+pysqlite:///{tmp_path}/p.db",
         dispatch_enabled=False,
         alert_config_path="config/alerts.yaml",
-        dedup_backend="memory",
         ui_cache_invalidate_on_write=False,
     )
     proc = AlertProcessor(settings, reload_yaml=True)

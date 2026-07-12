@@ -1,5 +1,6 @@
 """Outbox enqueue + worker drain with idempotency."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -100,7 +101,6 @@ def test_processor_enqueues_outbox_not_inline(tmp_path):
         dispatch_mode="outbox",
         dispatch_webhook_enabled=True,
         webhook_url="http://example.invalid/hook",
-        dedup_backend="memory",
         ui_cache_invalidate_on_write=False,
         alert_config_path="config/alerts.yaml",
     )
@@ -125,7 +125,6 @@ def test_reopen_disallowed_skips_emit(tmp_path):
     settings = Settings(
         database_url=f"sqlite+pysqlite:///{tmp_path}/r.db",
         dispatch_enabled=False,
-        dedup_backend="memory",
         ui_cache_invalidate_on_write=False,
         alert_config_path="config/alerts.yaml",
     )
@@ -138,3 +137,85 @@ def test_reopen_disallowed_skips_emit(tmp_path):
     result = proc.emit_alert(a2, allow_reopen_after_resolve=False)
     assert result.emitted is False
     assert result.skipped_reason == "reopen_disallowed"
+
+
+def test_claim_outbox_batch_is_exclusive(tmp_path):
+    """Two sequential claims never return the same row."""
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/claim.db")
+    for i in range(5):
+        repo.enqueue_dispatch(_alert(id=f"aid-{i}", occurrence_count=i + 1), ["webhook"])
+
+    first = repo.claim_outbox_batch(batch_size=3)
+    second = repo.claim_outbox_batch(batch_size=3)
+
+    first_ids = {r.id for r in first}
+    second_ids = {r.id for r in second}
+    assert len(first) == 3
+    assert len(second) == 2
+    assert first_ids.isdisjoint(second_ids)
+    assert all(r.status == "processing" for r in first + second)
+    assert all(r.attempts == 1 for r in first + second)
+
+
+def test_concurrent_claim_outbox_no_double_claim(tmp_path):
+    """Parallel workers must not claim the same outbox row (CAS)."""
+    db_url = f"sqlite+pysqlite:///{tmp_path}/concurrent.db"
+    repo = AlertRepository(db_url)
+    n_rows = 20
+    for i in range(n_rows):
+        repo.enqueue_dispatch(
+            _alert(id=f"c-{i}", occurrence_count=1, fingerprint=f"fp-{i}"),
+            ["webhook"],
+        )
+
+    # Separate repository instances (separate sessions) mimic multi-worker
+    workers = [AlertRepository(db_url) for _ in range(4)]
+
+    def claim_all(r: AlertRepository) -> list[int]:
+        claimed_ids: list[int] = []
+        while True:
+            batch = r.claim_outbox_batch(batch_size=3)
+            if not batch:
+                break
+            claimed_ids.extend(row.id for row in batch)
+        return claimed_ids
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+        results = list(pool.map(claim_all, workers))
+
+    all_ids = [oid for part in results for oid in part]
+    assert len(all_ids) == n_rows
+    assert len(set(all_ids)) == n_rows  # no duplicates
+
+    with repo.session() as session:
+        rows = list(session.scalars(select(DispatchOutbox)).all())
+        assert len(rows) == n_rows
+        assert all(r.status == "processing" for r in rows)
+        assert all(r.attempts == 1 for r in rows)
+
+
+def test_claim_increments_attempts_on_retry(tmp_path):
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/retry.db")
+    repo.enqueue_dispatch(_alert(id="retry-1"), ["webhook"])
+    claimed = repo.claim_outbox_batch(batch_size=1)
+    assert len(claimed) == 1 and claimed[0].attempts == 1
+
+    # Simulate failed attempt → back to failed/pending path
+    repo.mark_outbox_result(
+        claimed[0].id,
+        success=False,
+        error="boom",
+        max_attempts=5,
+        backoff_base_seconds=0.0,
+    )
+    # next_attempt_at may be in the future with backoff 0 still near-now
+    with repo.session() as session:
+        row = session.get(DispatchOutbox, claimed[0].id)
+        assert row is not None
+        row.next_attempt_at = datetime.now(timezone.utc)
+        row.status = "failed"
+
+    claimed2 = repo.claim_outbox_batch(batch_size=1)
+    assert len(claimed2) == 1
+    assert claimed2[0].id == claimed[0].id
+    assert claimed2[0].attempts == 2

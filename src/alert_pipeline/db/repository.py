@@ -36,9 +36,12 @@ _ACTIVE_FP_WHERE = "status IN ('open', 'updated', 'acknowledged')"
 
 class AlertRepository:
     def __init__(self, database_url: str) -> None:
-        connect_args = {}
+        connect_args: dict = {}
         if database_url.startswith("sqlite"):
+            # Multi-thread workers (tests / single-file demos) need a lock wait,
+            # not immediate "database is locked" failures.
             connect_args["check_same_thread"] = False
+            connect_args["timeout"] = 30
         self._engine = create_engine(database_url, future=True, connect_args=connect_args)
         self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
         # Bootstrap for tests / first boot. Production should prefer Alembic
@@ -290,11 +293,20 @@ class AlertRepository:
         batch_size: int = 50,
         stale_processing_seconds: int = 120,
     ) -> list[DispatchOutbox]:
-        """Mark a batch of due rows as processing and return them."""
+        """Mark a batch of due rows as processing and return them.
+
+        Multi-worker safe:
+        * PostgreSQL — ``SELECT … FOR UPDATE SKIP LOCKED`` so concurrent workers
+          co-claim distinct rows without blocking each other.
+        * All dialects — each row is claimed with a compare-and-swap
+          ``UPDATE … WHERE status IN ('pending','failed')`` so a second
+          worker never double-processes a row already claimed (covers SQLite
+          tests and any dialect without skip-locked).
+        """
         now = datetime.now(timezone.utc)
         stale_before = now - timedelta(seconds=stale_processing_seconds)
         with self.session() as session:
-            # Recover stale processing rows
+            # Recover stale processing rows (worker crash / kill -9 mid-send)
             session.execute(
                 update(DispatchOutbox)
                 .where(
@@ -303,26 +315,50 @@ class AlertRepository:
                 )
                 .values(status="pending", next_attempt_at=now)
             )
-            rows = list(
-                session.scalars(
-                    select(DispatchOutbox)
+
+            candidate_q = (
+                select(DispatchOutbox.id)
+                .where(
+                    DispatchOutbox.status.in_(("pending", "failed")),
+                    DispatchOutbox.next_attempt_at <= now,
+                )
+                .order_by(DispatchOutbox.next_attempt_at, DispatchOutbox.id)
+                .limit(batch_size)
+            )
+            # SKIP LOCKED is Postgres-specific; SQLAlchemy may emit invalid SQL
+            # on SQLite if skip_locked=True is set unconditionally.
+            if self._engine.dialect.name == "postgresql":
+                candidate_q = candidate_q.with_for_update(skip_locked=True)
+
+            candidate_ids = list(session.scalars(candidate_q).all())
+            if not candidate_ids:
+                return []
+
+            claimed: list[DispatchOutbox] = []
+            for oid in candidate_ids:
+                # Atomic claim: only transition if still claimable. Concurrent
+                # workers that selected the same id lose the race (rowcount=0).
+                result = session.execute(
+                    update(DispatchOutbox)
                     .where(
+                        DispatchOutbox.id == oid,
                         DispatchOutbox.status.in_(("pending", "failed")),
                         DispatchOutbox.next_attempt_at <= now,
                     )
-                    .order_by(DispatchOutbox.next_attempt_at, DispatchOutbox.id)
-                    .limit(batch_size)
-                ).all()
-            )
-            out: list[DispatchOutbox] = []
-            for row in rows:
-                row.status = "processing"
-                row.attempts = int(row.attempts or 0) + 1
-                row.updated_at = now
-                session.flush()
+                    .values(
+                        status="processing",
+                        attempts=DispatchOutbox.attempts + 1,
+                        updated_at=now,
+                    )
+                )
+                if result.rowcount != 1:
+                    continue
+                row = session.get(DispatchOutbox, oid)
+                if row is None:
+                    continue
                 session.expunge(row)
-                out.append(row)
-            return out
+                claimed.append(row)
+            return claimed
 
     def mark_outbox_sent(self, outbox_id: int) -> None:
         now = datetime.now(timezone.utc)

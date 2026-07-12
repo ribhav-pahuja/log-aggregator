@@ -18,9 +18,8 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.info(
-        "pipeline_runtime=%s dedup_backend=%s",
+        "pipeline_runtime=%s dedup=quix-keyed-state",
         settings.pipeline_runtime,
-        settings.dedup_backend,
     )
     run_pipeline(settings)
 

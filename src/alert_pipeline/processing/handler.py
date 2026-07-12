@@ -114,30 +114,27 @@ class AlertProcessor:
             self.alert_config.defaults.min_level or self.settings.alert_min_level
         )
 
-        # In-process memory engine is for unit tests only. Production uses Quix state.
+        # Dedup is never selected by env:
+        #   external_dedup=True  → Quix owns state; no in-process engine
+        #   external_dedup=False → MemoryDedupStore (unit tests / portable handle_event)
         if external_dedup:
-            store = MemoryDedupStore()
-            backend_label = "external (quix-state)"
+            self.engine = None
+            dedup_label = "quix-state (external)"
         else:
-            backend = self.settings.dedup_backend
-            store = MemoryDedupStore()
-            if backend in ("quix", "external"):
-                backend_label = "memory (use Quix runtime for quix-state)"
-            else:
-                backend_label = "memory"
+            self.engine = DedupEngine(
+                alert_config=self.alert_config,
+                store=MemoryDedupStore(),
+                window_seconds=self.settings.dedup_window_seconds,
+                update_interval_seconds=self.settings.dedup_update_interval_seconds,
+                min_level=min_level,
+            )
+            dedup_label = "memory (in-process)"
 
-        self.engine = DedupEngine(
-            alert_config=self.alert_config,
-            store=store,
-            window_seconds=self.settings.dedup_window_seconds,
-            update_interval_seconds=self.settings.dedup_update_interval_seconds,
-            min_level=min_level,
-        )
         self.repo = AlertRepository(self.settings.database_url)
         self.fanout = DispatchFanout(build_dispatchers(self.settings), repo=self.repo)
         logger.info(
             "AlertProcessor ready dedup=%s fields=%s window=%ss refire=%ss min_level=%s",
-            backend_label,
+            dedup_label,
             self.alert_config.defaults.dedup_fields,
             self.alert_config.defaults.dedup_window_seconds,
             self.alert_config.defaults.refire_interval_seconds,
@@ -158,7 +155,7 @@ class AlertProcessor:
 
     def handle_event(self, event: LogEvent) -> ProcessResult:
         """In-process dedup path (unit tests). Quix runtime uses emit_alert instead."""
-        if self.external_dedup:
+        if self.external_dedup or self.engine is None:
             raise RuntimeError(
                 "AlertProcessor was constructed with external_dedup=True; "
                 "use emit_alert() after Quix state dedup, not handle_event()"

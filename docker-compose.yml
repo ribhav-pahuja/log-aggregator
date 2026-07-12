@@ -141,8 +141,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (see .env.example)}
       # Redis: UI cache invalidation only (not pipeline dedup)
       REDIS_URL: redis://redis:6379/0
-      # Dedup runs in Quix keyed state (group_by fingerprint)
-      DEDUP_BACKEND: ${DEDUP_BACKEND:-quix}
+      # Dedup is always Quix keyed state (group_by fingerprint) — no DEDUP_BACKEND
       DEDUP_WINDOW_SECONDS: ${DEDUP_WINDOW_SECONDS:-300}
       DEDUP_UPDATE_INTERVAL_SECONDS: ${DEDUP_UPDATE_INTERVAL_SECONDS:-60}
       ALERT_MIN_LEVEL: ${ALERT_MIN_LEVEL:-ERROR}

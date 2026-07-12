@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from alert_pipeline.alert_config import load_alert_config
+from alert_pipeline.config import Settings
 from alert_pipeline.db.models import AlertRecord
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.metrics import apply_status_timestamps
@@ -81,3 +85,22 @@ def test_yaml_service_override():
 
     inv = cfg.resolve_for(LogEvent(service="inventory", message="x", level=LogLevel.ERROR))
     assert inv.min_level == "CRITICAL"
+
+
+def test_dedup_backend_setting_removed():
+    """DEDUP_BACKEND is not a Settings field — dedup path is fixed by runtime."""
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert not hasattr(s, "dedup_backend")
+
+
+def test_dedup_backend_redis_env_rejected(monkeypatch):
+    monkeypatch.setenv("DEDUP_BACKEND", "redis")
+    with pytest.raises((ValidationError, ValueError), match="redis was removed"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_dedup_backend_quix_env_ignored(monkeypatch):
+    """Legacy DEDUP_BACKEND=quix must not select a store or crash boot."""
+    monkeypatch.setenv("DEDUP_BACKEND", "quix")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.pipeline_runtime in ("quix", "quixstreams")

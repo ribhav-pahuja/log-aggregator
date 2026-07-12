@@ -339,7 +339,7 @@ Default **`DISPATCH_MODE=outbox`**:
 
 1. Emit path inserts one `dispatch_outbox` row per enabled channel with  
    `idempotency_key = {alert_id}:{channel}:{occurrence_count}` (unique).
-2. **`alert-dispatch-worker`** claims due rows (`pending`/`failed`), calls the channel, writes `dispatch_log`, marks `sent` / retries with backoff / `dead` after max attempts.
+2. **`alert-dispatch-worker`** claims due rows (`pending`/`failed`) multi-worker-safely (`FOR UPDATE SKIP LOCKED` on Postgres + compare-and-swap status transition), calls the channel, writes `dispatch_log`, marks `sent` / retries with backoff / `dead` after max attempts.
 3. Reprocessing that re-enqueues the same key is a no-op; worker also skips if audit already has a successful row for that key.
 
 `DISPATCH_MODE=inline` keeps legacy sync fan-out on the emit path (tests / simple demos only).

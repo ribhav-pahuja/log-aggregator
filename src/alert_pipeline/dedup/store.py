@@ -112,17 +112,9 @@ class MemoryDedupStore(DedupStore):
             return len(self._state)
 
 
-def build_dedup_store(backend: str = "memory") -> DedupStore:
-    """Build the in-process store used by unit tests / ``DedupEngine``.
+def build_memory_dedup_store() -> MemoryDedupStore:
+    """In-process store for unit tests / ``DedupEngine`` only.
 
-    Production Quix path uses Quix keyed state, not this helper.
+    Production never calls this — Quix keyed state owns live windows.
     """
-    name = (backend or "memory").strip().lower()
-    if name in ("memory", "local", "inprocess", "in-process", "quix", "external"):
-        return MemoryDedupStore()
-    if name == "redis":
-        raise ValueError(
-            "DEDUP_BACKEND=redis was removed. Use 'quix' (production Quix keyed state) "
-            "or 'memory' (in-process tests). Redis remains for UI cache only (REDIS_URL)."
-        )
-    raise ValueError(f"Unknown DEDUP_BACKEND {backend!r}; use 'quix' or 'memory'")
+    return MemoryDedupStore()

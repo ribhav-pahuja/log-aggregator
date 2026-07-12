@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Historical env var — never selected a real store after Quix keyed-state dedup.
+# Reject redis; warn and ignore everything else so old .env files still boot.
+_REMOVED_DEDUP_BACKEND_ENV = "DEDUP_BACKEND"
 
 
 class Settings(BaseSettings):
@@ -29,12 +37,16 @@ class Settings(BaseSettings):
 
     alert_config_path: str = "config/alerts.yaml"
 
+    # Window/refire fallbacks when YAML is missing a field (not a "backend" switch).
+    # Production windows come from config/alerts.yaml via Quix enrichment.
     dedup_window_seconds: int = Field(default=300, ge=1)
     dedup_update_interval_seconds: int = Field(default=60, ge=1)
     alert_min_level: str = "ERROR"
 
-    # quix = Quix keyed state (production); memory = unit tests / in-process engine
-    dedup_backend: Literal["quix", "memory"] = "quix"
+    # Dedup is not configurable via env:
+    #   production → Quix keyed state (runtime/quix_runtime.py)
+    #   unit tests → in-process MemoryDedupStore (DedupEngine)
+    # DEDUP_BACKEND was removed (see _reject_removed_dedup_backend).
 
     database_url: str = "sqlite+pysqlite:////tmp/alerts.db"
 
@@ -83,20 +95,42 @@ class Settings(BaseSettings):
             return "quixstreams"
         return name
 
-    @field_validator("dedup_backend", mode="before")
-    @classmethod
-    def _normalize_backend(cls, v: object) -> str:
-        if v is None or v == "":
-            return "quix"
-        name = str(v).strip().lower()
-        if name in ("external", "quix-state", "state"):
-            return "quix"
-        if name == "redis":
+    @model_validator(mode="after")
+    def _reject_removed_dedup_backend(self) -> Self:
+        """Fail closed on DEDUP_BACKEND=redis; warn if process env still sets it."""
+        # Process env (Compose/K8s/export) — the real footgun surface.
+        raw = (os.environ.get(_REMOVED_DEDUP_BACKEND_ENV) or "").strip()
+        # Also catch redis left only in a local .env (not exported).
+        if not raw:
+            try:
+                from dotenv import dotenv_values
+
+                raw = (dotenv_values(".env").get(_REMOVED_DEDUP_BACKEND_ENV) or "").strip()
+                # Don't warn about harmless leftovers in .env; only fail redis.
+                if raw and raw.lower() != "redis":
+                    return self
+            except Exception:  # noqa: BLE001
+                return self
+        if not raw:
+            return self
+        if raw.lower() == "redis":
             raise ValueError(
-                "DEDUP_BACKEND=redis was removed. Use 'quix' (production) or 'memory' "
-                "(tests). Redis remains for UI cache only (REDIS_URL)."
+                "DEDUP_BACKEND=redis was removed. Production dedup is always Quix "
+                "keyed state (group_by fingerprint). Unit tests use in-process memory. "
+                "Redis remains for UI cache only (REDIS_URL). Remove DEDUP_BACKEND from "
+                "your environment."
             )
-        return name
+        # Only warn when the shell/container still injects the var (not silent .env).
+        if _REMOVED_DEDUP_BACKEND_ENV in os.environ:
+            logger.warning(
+                "%s=%s is ignored and deprecated — dedup is always Quix keyed state in "
+                "production (in-process memory only for unit tests). Remove %s from your "
+                "environment.",
+                _REMOVED_DEDUP_BACKEND_ENV,
+                raw,
+                _REMOVED_DEDUP_BACKEND_ENV,
+            )
+        return self
 
 
 @lru_cache

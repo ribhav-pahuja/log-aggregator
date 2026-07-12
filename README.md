@@ -346,7 +346,6 @@ docker compose up -d kafka postgres redis webhook-debug
 export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 export DATABASE_URL=postgresql+psycopg://alerts:alerts@localhost:5432/alerts
 export REDIS_URL=redis://localhost:6379/0   # UI cache invalidation only
-export DEDUP_BACKEND=quix
 export DISPATCH_WEBHOOK_ENABLED=true
 export WEBHOOK_URL=http://localhost:8080/alerts
 alert-pipeline
