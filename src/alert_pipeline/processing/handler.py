@@ -210,8 +210,29 @@ class AlertProcessor:
                         skipped_reason="reopen_disallowed",
                     )
 
-        record = self.repo.upsert_alert(alert)
-        # Redis: UI snapshot only
+        dispatch_enabled = bool(self.settings.dispatch_enabled)
+        mode = (self.settings.dispatch_mode or "outbox").lower()
+        channels = enabled_channel_names(self.settings) if dispatch_enabled else []
+        outbox_mode = mode == "outbox" and bool(channels)
+
+        def _should_enqueue(record, al) -> bool:
+            # Suppress refire notifications while operator has acked the incident.
+            if not al.is_new and suppress_while_acked and record.status == "acknowledged":
+                return False
+            return True
+
+        # Single transaction: incident upsert + optional outbox rows.
+        # Redis invalidate and inline HTTP happen only after commit.
+        if outbox_mode:
+            record, keys = self.repo.upsert_and_maybe_enqueue(
+                alert,
+                channels,
+                should_enqueue=_should_enqueue,
+            )
+        else:
+            record = self.repo.upsert_alert(alert)
+            keys = []
+
         if self.settings.ui_cache_invalidate_on_write:
             invalidate_ui_snapshot(
                 self.settings.redis_url,
@@ -225,8 +246,19 @@ class AlertProcessor:
                 "Skip dispatch for acked incident %s (refire suppressed by YAML)",
                 alert.id,
             )
-        else:
-            self._dispatch_or_enqueue(alert)
+        elif dispatch_enabled and channels and mode == "inline":
+            self.fanout.dispatch(alert)
+        elif keys:
+            for key in keys:
+                parts = key.split(":")
+                channel = parts[1] if len(parts) >= 2 else "unknown"
+                OUTBOX_ENQUEUED.labels(channel=channel).inc()
+            logger.info(
+                "Enqueued %s outbox row(s) for alert %s (occurrence=%s)",
+                len(keys),
+                alert.id,
+                alert.occurrence_count,
+            )
 
         ALERTS_EMITTED.labels(is_new="true" if alert.is_new else "false").inc()
         return ProcessResult(
@@ -239,30 +271,3 @@ class AlertProcessor:
             severity=alert.severity.value,
             dispatch_suppressed=dispatch_suppressed,
         )
-
-    def _dispatch_or_enqueue(self, alert: AlertEvent) -> None:
-        """Outbox (default) or inline fan-out depending on DISPATCH_MODE."""
-        if not self.settings.dispatch_enabled:
-            return
-        channels = enabled_channel_names(self.settings)
-        if not channels:
-            return
-
-        mode = (self.settings.dispatch_mode or "outbox").lower()
-        if mode == "inline":
-            self.fanout.dispatch(alert)
-            return
-
-        keys = self.repo.enqueue_dispatch(alert, channels)
-        for key in keys:
-            # key format: alert_id:channel:count
-            parts = key.split(":")
-            channel = parts[1] if len(parts) >= 2 else "unknown"
-            OUTBOX_ENQUEUED.labels(channel=channel).inc()
-        if keys:
-            logger.info(
-                "Enqueued %s outbox row(s) for alert %s (occurrence=%s)",
-                len(keys),
-                alert.id,
-                alert.occurrence_count,
-            )

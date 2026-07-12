@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
@@ -92,12 +93,61 @@ class AlertRepository:
         rather than resetting it.
         """
         try:
-            return self._upsert_once(alert)
+            with self.session() as session:
+                return self._upsert_in_session(session, alert)
         except IntegrityError:
             # Concurrent insert of same active fingerprint — retry as update
             logger.info("Active fingerprint race for %s; retrying as update", alert.fingerprint)
             alert.is_new = False
-            return self._upsert_once(alert)
+            with self.session() as session:
+                return self._upsert_in_session(session, alert)
+
+    def upsert_and_maybe_enqueue(
+        self,
+        alert: AlertEvent,
+        channels: list[str],
+        *,
+        should_enqueue: Callable[[AlertRecord, AlertEvent], bool] | None = None,
+    ) -> tuple[AlertRecord, list[str]]:
+        """Upsert incident and optionally enqueue outbox rows in **one transaction**.
+
+        Prevents the failure mode where an incident is committed but outbox rows
+        never land (crash between separate upsert / enqueue commits).
+
+        ``should_enqueue`` is evaluated **after** upsert (so it can read DB status,
+        e.g. suppress dispatch while acknowledged). When it returns False or
+        ``channels`` is empty, only the upsert is committed.
+        """
+        try:
+            return self._upsert_and_maybe_enqueue_once(
+                alert, channels, should_enqueue=should_enqueue
+            )
+        except IntegrityError:
+            logger.info(
+                "Active fingerprint race for %s during emit; retrying as update",
+                alert.fingerprint,
+            )
+            alert.is_new = False
+            return self._upsert_and_maybe_enqueue_once(
+                alert, channels, should_enqueue=should_enqueue
+            )
+
+    def _upsert_and_maybe_enqueue_once(
+        self,
+        alert: AlertEvent,
+        channels: list[str],
+        *,
+        should_enqueue: Callable[[AlertRecord, AlertEvent], bool] | None,
+    ) -> tuple[AlertRecord, list[str]]:
+        with self.session() as session:
+            record = self._upsert_in_session(session, alert)
+            keys: list[str] = []
+            do_enqueue = bool(channels) and (
+                should_enqueue is None or should_enqueue(record, alert)
+            )
+            if do_enqueue:
+                keys = self._enqueue_in_session(session, alert, channels)
+            return record, keys
 
     def has_active_fingerprint(self, fingerprint: str) -> bool:
         with self.session() as session:
@@ -120,61 +170,60 @@ class AlertRepository:
             )
             return row is not None
 
-    def _upsert_once(self, alert: AlertEvent) -> AlertRecord:
-        with self.session() as session:
-            existing = session.scalar(
-                select(AlertRecord).where(
-                    AlertRecord.fingerprint == alert.fingerprint,
-                    AlertRecord.status.in_(_ACTIVE),
-                )
+    def _upsert_in_session(self, session: Session, alert: AlertEvent) -> AlertRecord:
+        existing = session.scalar(
+            select(AlertRecord).where(
+                AlertRecord.fingerprint == alert.fingerprint,
+                AlertRecord.status.in_(_ACTIVE),
             )
-            if existing is None:
-                # Reopen after resolve may reuse Quix state's alert_id; PK would collide.
-                by_id = session.get(AlertRecord, alert.id)
-                if by_id is not None:
-                    alert.id = str(uuid.uuid4())
-                    alert.is_new = True
-                record = AlertRecord(
-                    id=alert.id,
-                    fingerprint=alert.fingerprint,
-                    title=alert.title,
-                    description=alert.description,
-                    severity=alert.severity.value,
-                    service=alert.service,
-                    host=alert.host,
-                    status=alert.status.value,
-                    occurrence_count=alert.occurrence_count,
-                    first_seen=alert.first_seen,
-                    last_seen=alert.last_seen,
-                    error_code=alert.error_code,
-                    trace_id=alert.trace_id,
-                    labels_json=json.dumps(alert.labels),
-                    sample_message=alert.sample_message,
-                )
-                session.add(record)
-                session.flush()
-                session.expunge(record)
-                return record
-
-            # Never decrease counts (restart / multi-worker safety)
-            if alert.is_new or alert.occurrence_count <= existing.occurrence_count:
-                existing.occurrence_count = existing.occurrence_count + 1
-            else:
-                existing.occurrence_count = alert.occurrence_count
-
-            existing.last_seen = alert.last_seen
-            if existing.status != "acknowledged":
-                existing.status = "updated"
-            existing.severity = alert.severity.value
-            existing.sample_message = alert.sample_message or existing.sample_message
-            if alert.trace_id:
-                existing.trace_id = alert.trace_id
+        )
+        if existing is None:
+            # Reopen after resolve may reuse Quix state's alert_id; PK would collide.
+            by_id = session.get(AlertRecord, alert.id)
+            if by_id is not None:
+                alert.id = str(uuid.uuid4())
+                alert.is_new = True
+            record = AlertRecord(
+                id=alert.id,
+                fingerprint=alert.fingerprint,
+                title=alert.title,
+                description=alert.description,
+                severity=alert.severity.value,
+                service=alert.service,
+                host=alert.host,
+                status=alert.status.value,
+                occurrence_count=alert.occurrence_count,
+                first_seen=alert.first_seen,
+                last_seen=alert.last_seen,
+                error_code=alert.error_code,
+                trace_id=alert.trace_id,
+                labels_json=json.dumps(alert.labels),
+                sample_message=alert.sample_message,
+            )
+            session.add(record)
             session.flush()
-            alert.id = existing.id
-            alert.is_new = False
-            alert.occurrence_count = existing.occurrence_count
-            session.expunge(existing)
-            return existing
+            session.expunge(record)
+            return record
+
+        # Never decrease counts (restart / multi-worker safety)
+        if alert.is_new or alert.occurrence_count <= existing.occurrence_count:
+            existing.occurrence_count = existing.occurrence_count + 1
+        else:
+            existing.occurrence_count = alert.occurrence_count
+
+        existing.last_seen = alert.last_seen
+        if existing.status != "acknowledged":
+            existing.status = "updated"
+        existing.severity = alert.severity.value
+        existing.sample_message = alert.sample_message or existing.sample_message
+        if alert.trace_id:
+            existing.trace_id = alert.trace_id
+        session.flush()
+        alert.id = existing.id
+        alert.is_new = False
+        alert.occurrence_count = existing.occurrence_count
+        session.expunge(existing)
+        return existing
 
     def get_status(self, alert_id: str) -> str | None:
         with self.session() as session:
@@ -258,33 +307,45 @@ class AlertRepository:
         """Insert pending outbox rows (one per channel). Returns new idempotency keys.
 
         Duplicate keys (reprocessing) are ignored via unique constraint.
+        Prefer :meth:`upsert_and_maybe_enqueue` on the emit path so upsert and
+        enqueue share one transaction.
         """
+        if not channels:
+            return []
+        with self.session() as session:
+            return self._enqueue_in_session(session, alert, channels)
+
+    def _enqueue_in_session(
+        self,
+        session: Session,
+        alert: AlertEvent,
+        channels: list[str],
+    ) -> list[str]:
         if not channels:
             return []
         payload = json.dumps(alert.model_dump(mode="json"))
         now = datetime.now(timezone.utc)
         created: list[str] = []
-        with self.session() as session:
-            for channel in channels:
-                key = self.make_idempotency_key(alert.id, channel, alert.occurrence_count)
-                exists = session.scalar(
-                    select(DispatchOutbox.id).where(DispatchOutbox.idempotency_key == key)
+        for channel in channels:
+            key = self.make_idempotency_key(alert.id, channel, alert.occurrence_count)
+            exists = session.scalar(
+                select(DispatchOutbox.id).where(DispatchOutbox.idempotency_key == key)
+            )
+            if exists is not None:
+                continue
+            session.add(
+                DispatchOutbox(
+                    idempotency_key=key,
+                    alert_id=alert.id,
+                    channel=channel,
+                    payload_json=payload,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=now,
                 )
-                if exists is not None:
-                    continue
-                session.add(
-                    DispatchOutbox(
-                        idempotency_key=key,
-                        alert_id=alert.id,
-                        channel=channel,
-                        payload_json=payload,
-                        status="pending",
-                        attempts=0,
-                        next_attempt_at=now,
-                    )
-                )
-                created.append(key)
-            session.flush()
+            )
+            created.append(key)
+        session.flush()
         return created
 
     def claim_outbox_batch(

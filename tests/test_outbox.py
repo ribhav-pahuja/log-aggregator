@@ -219,3 +219,84 @@ def test_claim_increments_attempts_on_retry(tmp_path):
     assert len(claimed2) == 1
     assert claimed2[0].id == claimed[0].id
     assert claimed2[0].attempts == 2
+
+
+def test_upsert_and_maybe_enqueue_atomic_success(tmp_path):
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/atomic.db")
+    a = _alert(id="atomic-1", fingerprint="fp-atomic")
+    record, keys = repo.upsert_and_maybe_enqueue(a, ["webhook", "teams"])
+    assert record.id == "atomic-1"
+    assert len(keys) == 2
+    with repo.session() as session:
+        from alert_pipeline.db.models import AlertRecord
+
+        assert session.get(AlertRecord, "atomic-1") is not None
+        assert len(list(session.scalars(select(DispatchOutbox)).all())) == 2
+
+
+def test_upsert_and_maybe_enqueue_skips_when_predicate_false(tmp_path):
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/skip.db")
+    a = _alert(id="skip-1")
+    record, keys = repo.upsert_and_maybe_enqueue(
+        a,
+        ["webhook"],
+        should_enqueue=lambda _rec, _al: False,
+    )
+    assert record.id == "skip-1"
+    assert keys == []
+    with repo.session() as session:
+        assert list(session.scalars(select(DispatchOutbox)).all()) == []
+
+
+def test_upsert_and_maybe_enqueue_rolls_back_on_enqueue_failure(tmp_path):
+    """If outbox insert fails mid-txn, the alert upsert must not commit."""
+    repo = AlertRepository(f"sqlite+pysqlite:///{tmp_path}/rollback.db")
+    a = _alert(id="rb-1", fingerprint="fp-rb")
+
+    original = repo._enqueue_in_session
+
+    def boom(session, alert, channels):
+        raise RuntimeError("simulated outbox failure")
+
+    repo._enqueue_in_session = boom  # type: ignore[method-assign]
+    try:
+        try:
+            repo.upsert_and_maybe_enqueue(a, ["webhook"])
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError as exc:
+            assert "simulated outbox failure" in str(exc)
+    finally:
+        repo._enqueue_in_session = original  # type: ignore[method-assign]
+
+    with repo.session() as session:
+        from alert_pipeline.db.models import AlertRecord
+
+        assert session.get(AlertRecord, "rb-1") is None
+        assert list(session.scalars(select(DispatchOutbox)).all()) == []
+
+
+def test_processor_emit_uses_atomic_outbox(tmp_path):
+    """emit_alert must land alert + outbox together (no separate commits)."""
+    settings = Settings(
+        database_url=f"sqlite+pysqlite:///{tmp_path}/emit-atomic.db",
+        dispatch_enabled=True,
+        dispatch_mode="outbox",
+        dispatch_webhook_enabled=True,
+        webhook_url="http://example.invalid/hook",
+        ui_cache_invalidate_on_write=False,
+        alert_config_path="config/alerts.yaml",
+    )
+    proc = AlertProcessor(settings, reload_yaml=True)
+    calls: list[str] = []
+    real = proc.repo.upsert_and_maybe_enqueue
+
+    def spy(alert, channels, *, should_enqueue=None):
+        calls.append("atomic")
+        return real(alert, channels, should_enqueue=should_enqueue)
+
+    proc.repo.upsert_and_maybe_enqueue = spy  # type: ignore[method-assign]
+    r = proc.emit_alert(_alert(fingerprint="fp-emit-atomic", message="x"))
+    assert r.emitted is True
+    assert calls == ["atomic"]
+    with proc.repo.session() as session:
+        assert len(list(session.scalars(select(DispatchOutbox)).all())) == 1

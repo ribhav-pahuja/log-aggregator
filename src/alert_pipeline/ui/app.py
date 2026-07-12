@@ -566,17 +566,18 @@ def create_app() -> FastAPI:
             if existing_id:
                 alert_kwargs["id"] = existing_id
             alert = AlertEvent(**alert_kwargs)
-            record = repo.upsert_alert(alert)
-            existing_id = record.id
-            alert_id = record.id
-            if is_first_create and i == 0:
-                channels = enabled_channel_names(settings)
-                mode = (settings.dispatch_mode or "outbox").lower()
-                if mode == "inline":
+            channels = enabled_channel_names(settings)
+            mode = (settings.dispatch_mode or "outbox").lower()
+            if is_first_create and i == 0 and mode == "outbox" and channels:
+                # Atomic upsert + outbox (same as pipeline emit path)
+                record, _keys = repo.upsert_and_maybe_enqueue(alert, channels)
+            else:
+                record = repo.upsert_alert(alert)
+                if is_first_create and i == 0 and mode == "inline" and channels:
                     fanout = DispatchFanout(build_dispatchers(settings), repo=repo)
                     fanout.dispatch(alert)
-                elif channels:
-                    repo.enqueue_dispatch(alert, channels)
+            existing_id = record.id
+            alert_id = record.id
 
         _touch_cache()
         if alert_id:

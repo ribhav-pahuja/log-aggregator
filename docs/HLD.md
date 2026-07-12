@@ -381,14 +381,15 @@ Channel HTTP still uses **tenacity** inside each dispatcher. Payload: `AlertEven
 Intended order in `emit_alert` (outbox mode):
 
 1. **Reopen policy** (optional skip).
-2. **Upsert Postgres** (incident visible to operators).
-3. **Invalidate UI cache** (best-effort; failure should not block).
-4. **Enqueue outbox** rows (same DB; unique key prevents dup enqueue).
+2. **One Postgres transaction:** upsert incident **and** enqueue outbox rows
+   (`AlertRepository.upsert_and_maybe_enqueue`). Ack-suppress is decided after
+   upsert inside the same txn so refires on acknowledged incidents skip enqueue.
+3. **Invalidate UI cache** (best-effort; only after commit; failure should not block).
 
 | Crash / failure point | Likely outcome |
 | --- | --- |
-| After state emit decision, before upsert | May reprocess; state may re-emit; outbox key still unique after successful enqueue |
-| After upsert, before enqueue | Incident exists; no notify until next refire/reprocess |
+| After state emit decision, before commit | May reprocess; state may re-emit; outbox key still unique after successful commit |
+| Mid-transaction (upsert+enqueue) | Full rollback — no orphan incident without outbox rows |
 | Worker fails HTTP | Row retries with backoff then `dead`; check outbox + `dispatch_log` |
 | Redis down on invalidate | UI may show stale list until TTL/miss; **dedup unaffected** |
 
@@ -401,7 +402,8 @@ Intended order in `emit_alert` (outbox mode):
 ```
 Producer → Kafka(logs) → Quix enrich → group_by(fp)
   → state: empty → emit new AlertEvent
-  → repo.upsert INSERT → dispatch fan-out → UI cache invalidate
+  → repo.upsert+outbox (one txn) → UI cache invalidate
+  → alert-dispatch-worker → channels
 ```
 
 #### Duplicate within window (suppressed)
