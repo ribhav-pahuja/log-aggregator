@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package (dev)
+        run: pip install -e ".[dev]"
+
+      - name: Ruff check
+        run: ruff check src tests
+
+      - name: Ruff format (check)
+        run: ruff format --check src tests
+
+      - name: Pytest
+        run: pytest -q
+
+  migrate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alerts
+          POSTGRES_PASSWORD: alerts
+          POSTGRES_DB: alerts
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alerts -d alerts"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://alerts:alerts@localhost:5432/alerts
+        run: alembic upgrade head
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build pipeline image
+        run: docker build -f Dockerfile.pipeline -t alert-pipeline:ci .
+
+      - name: Build UI image
+        run: docker build -f Dockerfile.ui -t alert-ui:ci .
