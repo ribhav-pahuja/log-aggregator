@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 
-import pytest
-
 from alert_pipeline.dedup.engine import DedupEngine
 from alert_pipeline.dedup.fingerprint import compute_fingerprint
 from alert_pipeline.dedup.store import MemoryDedupStore, build_memory_dedup_store
