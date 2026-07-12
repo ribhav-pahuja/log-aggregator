@@ -1,25 +1,25 @@
 """In-process deduplication engine (unit tests / non-Quix paths).
 
-Production dedup runs in Quix keyed state (``dedup/quix_state.py``).
+Rules live in ``transition.apply_dedup_transition``. This class only owns
+config resolution and the memory store adapter.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
-from uuid import uuid4
 
 from alert_pipeline.alert_config import AlertYamlConfig, RefireSettings, get_alert_config
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
 from alert_pipeline.dedup.store import DedupStore, IncidentState, MemoryDedupStore
-from alert_pipeline.schemas import (
-    LEVEL_RANK,
-    AlertEvent,
-    AlertStatus,
-    LogEvent,
-    LogLevel,
+from alert_pipeline.dedup.transition import (
+    alert_event_from_state,
+    apply_dedup_transition,
+    dict_to_incident_fields,
+    event_clock,
+    incident_state_to_dict,
 )
+from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, LogEvent, LogLevel
 
 logger = logging.getLogger(__name__)
 
@@ -64,122 +64,75 @@ class DedupEngine:
         if LEVEL_RANK.get(event.level, 0) < min_rank:
             return None
 
-        # Event-time for window/refire/expiry (not wall-clock processing time).
-        now_ts = event.timestamp.timestamp() if event.timestamp else time.time()
-        wall = time.time()
-        if now_ts > wall + 300:
-            now_ts = wall
-        self._store.expire_stale(now_ts)
+        event_ts = event_clock(event)
+        self._store.expire_stale(event_ts)
 
         fingerprint = compute_fingerprint(event, cfg.dedup_fields)
         title = build_title(event)
-        existing = self._store.get(fingerprint)
+        existing_obj = self._store.get(fingerprint)
+        existing = incident_state_to_dict(existing_obj) if existing_obj is not None else None
 
-        if existing is None:
-            alert_id = str(uuid4())
-            state = IncidentState(
-                alert_id=alert_id,
-                fingerprint=fingerprint,
-                first_seen=event.timestamp,
-                last_seen=event.timestamp,
-                occurrence_count=1,
-                last_emitted_at=now_ts,
-                severity=event.level,
-                service=event.service,
-                host=event.host,
-                title=title,
-                sample_message=event.message,
-                error_code=event.error_code,
-                trace_id=event.trace_id,
-                labels=dict(event.labels),
-                window_seconds=cfg.dedup_window_seconds,
+        result = apply_dedup_transition(
+            existing=existing,
+            event=event,
+            fingerprint=fingerprint,
+            window_seconds=cfg.dedup_window_seconds,
+            refire_interval_seconds=cfg.refire_interval_seconds,
+            title=title,
+            event_ts=event_ts,
+        )
+        fields = dict_to_incident_fields(result.state)
+        incident = IncidentState(**fields)
+
+        if result.action == "new":
+            created = self._store.try_create(
+                incident, ttl_seconds=cfg.dedup_window_seconds
             )
-            created = self._store.try_create(state, ttl_seconds=cfg.dedup_window_seconds)
             if not created:
-                # Race with another thread — treat as existing
-                existing = self._store.get(fingerprint)
-                if existing is None:
+                # Race with another thread — re-apply against the winner's state
+                winner = self._store.get(fingerprint)
+                if winner is None:
                     return None
-            else:
-                logger.info(
-                    "New incident fingerprint=%s service=%s window=%ss refire=%ss",
-                    fingerprint,
-                    event.service,
-                    cfg.dedup_window_seconds,
-                    cfg.refire_interval_seconds,
-                )
-                return AlertEvent(
-                    id=alert_id,
+                result = apply_dedup_transition(
+                    existing=incident_state_to_dict(winner),
+                    event=event,
                     fingerprint=fingerprint,
+                    window_seconds=cfg.dedup_window_seconds,
+                    refire_interval_seconds=cfg.refire_interval_seconds,
                     title=title,
-                    description=event.message,
-                    severity=event.level,
-                    service=event.service,
-                    host=event.host,
-                    status=AlertStatus.OPEN,
-                    occurrence_count=1,
-                    first_seen=event.timestamp,
-                    last_seen=event.timestamp,
-                    error_code=event.error_code,
-                    trace_id=event.trace_id,
-                    labels=event.labels,
-                    sample_message=event.message,
-                    is_new=True,
+                    event_ts=event_ts,
+                )
+                incident = IncidentState(**dict_to_incident_fields(result.state))
+                self._store.put(incident, ttl_seconds=cfg.dedup_window_seconds)
+                if result.action == "suppress":
+                    return None
+                return alert_event_from_state(
+                    result.state, is_new=False, description=event.message
                 )
 
-        existing.occurrence_count += 1
-        existing.last_seen = event.timestamp
-        existing.sample_message = event.message
-        existing.window_seconds = cfg.dedup_window_seconds
-        if event.trace_id:
-            existing.trace_id = event.trace_id
-        if LEVEL_RANK[event.level] > LEVEL_RANK[existing.severity]:
-            existing.severity = event.level
+            logger.info(
+                "New incident fingerprint=%s service=%s window=%ss refire=%ss",
+                fingerprint,
+                event.service,
+                cfg.dedup_window_seconds,
+                cfg.refire_interval_seconds,
+            )
+            return alert_event_from_state(
+                result.state, is_new=True, description=event.message
+            )
 
-        should_emit_update = (now_ts - existing.last_emitted_at) >= cfg.refire_interval_seconds
-        if not should_emit_update:
-            self._store.put(existing, ttl_seconds=cfg.dedup_window_seconds)
+        self._store.put(incident, ttl_seconds=cfg.dedup_window_seconds)
+        if result.action == "suppress":
             logger.debug(
                 "Suppressed duplicate fingerprint=%s count=%s (refire in %ss)",
                 fingerprint,
-                existing.occurrence_count,
+                result.state.get("occurrence_count"),
                 cfg.refire_interval_seconds,
             )
             return None
 
-        existing.last_emitted_at = now_ts
-        self._store.put(existing, ttl_seconds=cfg.dedup_window_seconds)
-        return self._to_alert(
-            existing, is_new=False, status=AlertStatus.UPDATED, description=event.message
-        )
-
-    @staticmethod
-    def _to_alert(
-        state: IncidentState,
-        *,
-        is_new: bool,
-        status: AlertStatus,
-        description: str,
-    ) -> AlertEvent:
-        return AlertEvent(
-            id=state.alert_id,
-            fingerprint=state.fingerprint,
-            title=state.title,
-            description=description,
-            severity=state.severity
-            if isinstance(state.severity, LogLevel)
-            else LogLevel.normalize(str(state.severity)),
-            service=state.service,
-            host=state.host,
-            status=status,
-            occurrence_count=state.occurrence_count,
-            first_seen=state.first_seen,
-            last_seen=state.last_seen,
-            error_code=state.error_code,
-            trace_id=state.trace_id,
-            labels=state.labels,
-            sample_message=state.sample_message,
-            is_new=is_new,
+        return alert_event_from_state(
+            result.state, is_new=False, description=event.message
         )
 
     def stats(self) -> dict[str, int]:

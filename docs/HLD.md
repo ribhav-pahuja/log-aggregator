@@ -325,7 +325,8 @@ After `group_by(fingerprint)`, each key holds an incident blob: `alert_id`, coun
 
 **Time model:** window and refire use **event time** (`event.timestamp`). Far-future timestamps are clamped to wall-clock (±5 min skew). Injectable `now` remains for unit tests. There is still **no full watermark / late-data side output** — very late events can reopen windows relative to their own timestamps.
 
-Unit tests: `tests/test_quix_dedup_state.py`, `tests/test_event_time.py`. In-process `DedupEngine` + memory store remain for **unit tests only**, not multi-worker production.
+Unit tests: `tests/test_quix_dedup_state.py`, `tests/test_event_time.py`, `tests/test_dedup_parity.py`.  
+**Single rule core:** `dedup/transition.py` (`apply_dedup_transition`) is shared by Quix (`quix_state.py`) and in-process `DedupEngine` so window/refire semantics cannot drift. Memory store remains for **unit tests only**, not multi-worker production.
 
 ### 5.5 AlertProcessor (persist + outbox)
 
