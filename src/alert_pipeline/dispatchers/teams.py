@@ -27,7 +27,13 @@ _THEME = {
 class TeamsDispatcher(AlertDispatcher):
     name = "microsoft_teams"
 
-    def __init__(self, webhook_url: str) -> None:
+    def __init__(
+        self,
+        webhook_url: str,
+        *,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        super().__init__(http_client=http_client)
         if not webhook_url:
             raise ValueError("teams_webhook_url is required when Teams is enabled")
         self.webhook_url = webhook_url
@@ -63,8 +69,7 @@ class TeamsDispatcher(AlertDispatcher):
         reraise=True,
     )
     def _post(self, body: JsonObject) -> httpx.Response:
-        with httpx.Client(timeout=15.0) as client:
-            return client.post(self.webhook_url, json=body)
+        return self._http().post(self.webhook_url, json=body)
 
     def send(self, alert: AlertEvent) -> DispatchResult:
         try:

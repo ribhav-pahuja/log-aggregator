@@ -22,8 +22,13 @@ class ZendutyDispatcher(AlertDispatcher):
     name = "zenduty"
 
     def __init__(
-        self, integration_key: str, api_url: str = "https://www.zenduty.com/api/events"
+        self,
+        integration_key: str,
+        api_url: str = "https://www.zenduty.com/api/events",
+        *,
+        http_client: httpx.Client | None = None,
     ) -> None:
+        super().__init__(http_client=http_client)
         if not integration_key:
             raise ValueError("zenduty_integration_key is required when Zenduty is enabled")
         self.integration_key = integration_key
@@ -65,8 +70,7 @@ class ZendutyDispatcher(AlertDispatcher):
     )
     def _post(self, body: JsonObject) -> httpx.Response:
         url = f"{self.api_url}/{self.integration_key}/"
-        with httpx.Client(timeout=15.0) as client:
-            return client.post(url, json=body)
+        return self._http().post(url, json=body)
 
     def send(self, alert: AlertEvent) -> DispatchResult:
         try:

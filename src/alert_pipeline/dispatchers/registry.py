@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+import httpx
+
 from alert_pipeline.config import Settings
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dispatchers.base import AlertDispatcher, DispatchResult
@@ -15,7 +17,34 @@ from alert_pipeline.schemas import AlertEvent
 logger = logging.getLogger(__name__)
 
 
-def build_dispatchers(settings: Settings) -> list[AlertDispatcher]:
+def enabled_channel_names(settings: Settings) -> list[str]:
+    """Channel names that would receive a dispatch for the current config.
+
+    Pure config inspection — does not construct HTTP clients or dispatchers.
+    """
+    if not settings.dispatch_enabled:
+        return []
+    names: list[str] = []
+    if settings.dispatch_zenduty_enabled:
+        names.append(ZendutyDispatcher.name)
+    if settings.dispatch_teams_enabled:
+        names.append(TeamsDispatcher.name)
+    if settings.dispatch_webhook_enabled:
+        names.append(WebhookDispatcher.name)
+    return names
+
+
+def build_dispatchers(
+    settings: Settings,
+    *,
+    http_client: httpx.Client | None = None,
+) -> list[AlertDispatcher]:
+    """Construct enabled channel dispatchers.
+
+    Pass ``http_client`` to share one connection pool (outbox worker). When
+    omitted, dispatchers use the process-wide client from
+    :mod:`alert_pipeline.dispatchers.http`.
+    """
     if not settings.dispatch_enabled:
         logger.info("Dispatch globally disabled")
         return []
@@ -26,24 +55,26 @@ def build_dispatchers(settings: Settings) -> list[AlertDispatcher]:
             ZendutyDispatcher(
                 integration_key=settings.zenduty_integration_key,
                 api_url=settings.zenduty_api_url,
+                http_client=http_client,
             )
         )
     if settings.dispatch_teams_enabled:
-        dispatchers.append(TeamsDispatcher(webhook_url=settings.teams_webhook_url))
+        dispatchers.append(
+            TeamsDispatcher(
+                webhook_url=settings.teams_webhook_url,
+                http_client=http_client,
+            )
+        )
     if settings.dispatch_webhook_enabled:
         dispatchers.append(
             WebhookDispatcher(
                 url=settings.webhook_url,
                 headers=parse_headers_json(settings.webhook_headers_json),
+                http_client=http_client,
             )
         )
     logger.info("Enabled dispatchers: %s", [d.name for d in dispatchers] or ["(none)"])
     return dispatchers
-
-
-def enabled_channel_names(settings: Settings) -> list[str]:
-    """Channel names that would receive a dispatch for the current config."""
-    return [d.name for d in build_dispatchers(settings)]
 
 
 class DispatchFanout:

@@ -18,7 +18,14 @@ logger = logging.getLogger(__name__)
 class WebhookDispatcher(AlertDispatcher):
     name = "webhook"
 
-    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        super().__init__(http_client=http_client)
         if not url:
             raise ValueError("webhook_url is required when generic webhook is enabled")
         self.url = url
@@ -30,8 +37,7 @@ class WebhookDispatcher(AlertDispatcher):
         reraise=True,
     )
     def _post(self, body: JsonObject) -> httpx.Response:
-        with httpx.Client(timeout=15.0) as client:
-            return client.post(self.url, json=body, headers=self.headers)
+        return self._http().post(self.url, json=body, headers=self.headers)
 
     def send(self, alert: AlertEvent) -> DispatchResult:
         try:

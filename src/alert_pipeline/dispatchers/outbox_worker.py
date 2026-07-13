@@ -15,6 +15,10 @@ import time
 
 from alert_pipeline.config import Settings, get_settings
 from alert_pipeline.db.repository import AlertRepository
+from alert_pipeline.dispatchers.http import (
+    close_dispatch_http_client,
+    create_dispatch_http_client,
+)
 from alert_pipeline.dispatchers.registry import DispatchFanout, build_dispatchers
 from alert_pipeline.observability import (
     DISPATCH_ATTEMPTS,
@@ -104,7 +108,6 @@ def run_worker(settings: Settings | None = None) -> None:
         stream=sys.stdout,
     )
     repo = AlertRepository(settings.database_url)
-    fanout = DispatchFanout(build_dispatchers(settings), repo=repo)
 
     stop = False
 
@@ -116,17 +119,27 @@ def run_worker(settings: Settings | None = None) -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    logger.info(
-        "Dispatch worker started mode=outbox poll=%ss batch=%s max_attempts=%s",
-        settings.dispatch_outbox_poll_seconds,
-        settings.dispatch_outbox_batch_size,
-        settings.dispatch_outbox_max_attempts,
-    )
-    while not stop:
-        n = process_batch(repo, fanout, settings)
-        if n == 0:
-            time.sleep(settings.dispatch_outbox_poll_seconds)
-        # else immediately poll again while there is work
+    # One pooled client for the worker lifetime — all channels share keep-alive.
+    with create_dispatch_http_client() as http_client:
+        fanout = DispatchFanout(
+            build_dispatchers(settings, http_client=http_client),
+            repo=repo,
+        )
+        logger.info(
+            "Dispatch worker started mode=outbox poll=%ss batch=%s max_attempts=%s",
+            settings.dispatch_outbox_poll_seconds,
+            settings.dispatch_outbox_batch_size,
+            settings.dispatch_outbox_max_attempts,
+        )
+        try:
+            while not stop:
+                n = process_batch(repo, fanout, settings)
+                if n == 0:
+                    time.sleep(settings.dispatch_outbox_poll_seconds)
+                # else immediately poll again while there is work
+        finally:
+            # Drop process singleton too in case any path used it.
+            close_dispatch_http_client()
 
 
 def main() -> None:
