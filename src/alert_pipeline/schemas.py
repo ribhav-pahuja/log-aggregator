@@ -134,21 +134,96 @@ class LogEvent(BaseModel):
 
 
 class AlertStatus(str, Enum):
+    """Incident lifecycle status (DB ``alerts.status`` + pipeline ``AlertEvent``)."""
+
     OPEN = "open"
     UPDATED = "updated"
     ACKNOWLEDGED = "acknowledged"
     RESOLVED = "resolved"
     SUPPRESSED = "suppressed"
 
+    @classmethod
+    def parse(cls, value: "AlertStatus | str") -> "AlertStatus":
+        if isinstance(value, cls):
+            return value
+        return cls(str(value))
+
 
 # Statuses that still represent an active incident (dedup merges into these rows).
-ACTIVE_ALERT_STATUSES = frozenset(
+ACTIVE_ALERT_STATUSES: frozenset[AlertStatus] = frozenset(
     {
-        AlertStatus.OPEN.value,
-        AlertStatus.UPDATED.value,
-        AlertStatus.ACKNOWLEDGED.value,
+        AlertStatus.OPEN,
+        AlertStatus.UPDATED,
+        AlertStatus.ACKNOWLEDGED,
     }
 )
+# String values for SQLAlchemy filters / JSON (str Enum members also compare equal).
+ACTIVE_ALERT_STATUS_VALUES: frozenset[str] = frozenset(s.value for s in ACTIVE_ALERT_STATUSES)
+
+# Operator-settable via UI/API (not pipeline-only SUPPRESSED).
+OPERATOR_ALERT_STATUSES: frozenset[AlertStatus] = frozenset(
+    {
+        AlertStatus.OPEN,
+        AlertStatus.UPDATED,
+        AlertStatus.ACKNOWLEDGED,
+        AlertStatus.RESOLVED,
+    }
+)
+OPERATOR_ALERT_STATUS_VALUES: frozenset[str] = frozenset(s.value for s in OPERATOR_ALERT_STATUSES)
+
+# Partial unique index / runtime CREATE INDEX — single source of truth for SQL.
+ACTIVE_ALERT_STATUS_SQL: str = (
+    "status IN ("
+    + ", ".join(f"'{s.value}'" for s in sorted(ACTIVE_ALERT_STATUSES, key=lambda x: x.value))
+    + ")"
+)
+
+
+class OutboxStatus(str, Enum):
+    """Dispatch outbox row status (DB ``dispatch_outbox.status``)."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SENT = "sent"
+    FAILED = "failed"
+    DEAD = "dead"
+
+    @classmethod
+    def parse(cls, value: "OutboxStatus | str") -> "OutboxStatus":
+        if isinstance(value, cls):
+            return value
+        return cls(str(value))
+
+
+# Open work: still needs a worker (or is mid-flight).
+OUTBOX_OPEN_STATUSES: frozenset[OutboxStatus] = frozenset(
+    {
+        OutboxStatus.PENDING,
+        OutboxStatus.PROCESSING,
+        OutboxStatus.FAILED,
+    }
+)
+OUTBOX_OPEN_STATUS_VALUES: frozenset[str] = frozenset(s.value for s in OUTBOX_OPEN_STATUSES)
+
+# Claimable by a worker on the next poll.
+OUTBOX_CLAIMABLE_STATUSES: frozenset[OutboxStatus] = frozenset(
+    {
+        OutboxStatus.PENDING,
+        OutboxStatus.FAILED,
+    }
+)
+OUTBOX_CLAIMABLE_STATUS_VALUES: frozenset[str] = frozenset(
+    s.value for s in OUTBOX_CLAIMABLE_STATUSES
+)
+
+# Operator redrive source statuses.
+OUTBOX_REDRIVE_STATUSES: frozenset[OutboxStatus] = frozenset(
+    {
+        OutboxStatus.DEAD,
+        OutboxStatus.FAILED,
+    }
+)
+OUTBOX_REDRIVE_STATUS_VALUES: frozenset[str] = frozenset(s.value for s in OUTBOX_REDRIVE_STATUSES)
 
 
 class AlertEvent(BaseModel):

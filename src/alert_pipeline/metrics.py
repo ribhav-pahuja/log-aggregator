@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from alert_pipeline.db.models import AlertRecord
+from alert_pipeline.schemas import AlertStatus
 
 
 def _aware(dt: datetime) -> datetime:
@@ -25,20 +26,24 @@ def _seconds_between(start: datetime, end: datetime) -> int:
 
 
 def apply_status_timestamps(
-    row: AlertRecord, new_status: str, *, now: datetime | None = None
+    row: AlertRecord,
+    new_status: AlertStatus | str,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Mutate row with status + TTA/TTR timestamps and durations."""
     now = now or datetime.now(timezone.utc)
-    prev = row.status
-    row.status = new_status
+    new = AlertStatus.parse(new_status)
+    prev = AlertStatus.parse(row.status) if row.status else None
+    row.status = new.value
     row.updated_at = now
 
-    if new_status == "acknowledged" and prev in ("open", "updated"):
+    if new is AlertStatus.ACKNOWLEDGED and prev in (AlertStatus.OPEN, AlertStatus.UPDATED):
         row.acknowledged_at = now
         row.tta_seconds = _seconds_between(row.first_seen, now)
         # Clearing a previous resolve is not expected here; leave resolved_* alone
 
-    elif new_status == "resolved" and prev != "resolved":
+    elif new is AlertStatus.RESOLVED and prev is not AlertStatus.RESOLVED:
         row.resolved_at = now
         row.ttr_seconds = _seconds_between(row.first_seen, now)
         # Implicit ack at resolve time if operator never acked (common for fast fixes)
@@ -46,12 +51,12 @@ def apply_status_timestamps(
             row.acknowledged_at = now
             row.tta_seconds = row.ttr_seconds
 
-    elif new_status == "open" and prev == "acknowledged":
+    elif new is AlertStatus.OPEN and prev is AlertStatus.ACKNOWLEDGED:
         # Un-ack: wipe ack metrics so a later ack recomputes TTA
         row.acknowledged_at = None
         row.tta_seconds = None
 
-    elif new_status in ("open", "updated") and prev == "resolved":
+    elif new in (AlertStatus.OPEN, AlertStatus.UPDATED) and prev is AlertStatus.RESOLVED:
         # Full reopen of a closed incident
         row.resolved_at = None
         row.ttr_seconds = None

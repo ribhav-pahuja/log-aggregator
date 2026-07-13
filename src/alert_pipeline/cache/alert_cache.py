@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from alert_pipeline.db.mapping import alert_view_from_record, dispatch_view_from_log
 from alert_pipeline.db.models import AlertRecord, DispatchLog
 from alert_pipeline.schemas import (
+    AlertStatus,
     AlertView,
     CachedAlert,
     CachedDispatch,
@@ -416,10 +417,10 @@ class AlertReadCache:
             last_at = session.scalar(select(func.max(AlertRecord.last_seen)))
             snap.stats = StatsView(
                 total=total,
-                open=_count("open"),
-                updated=_count("updated"),
-                acknowledged=_count("acknowledged"),
-                resolved=_count("resolved"),
+                open=_count(AlertStatus.OPEN.value),
+                updated=_count(AlertStatus.UPDATED.value),
+                acknowledged=_count(AlertStatus.ACKNOWLEDGED.value),
+                resolved=_count(AlertStatus.RESOLVED.value),
                 critical_or_error=crit,
                 services=len(snap.services),
                 dispatches_ok=ok,

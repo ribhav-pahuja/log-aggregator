@@ -26,14 +26,14 @@ from alert_pipeline.observability import (
     OUTBOX_PENDING,
     OUTBOX_PROCESSED,
 )
-from alert_pipeline.schemas import AlertEvent
+from alert_pipeline.schemas import AlertEvent, OutboxStatus
 
 logger = logging.getLogger(__name__)
 
 
 def _refresh_outbox_gauges(repo: AlertRepository) -> None:
     OUTBOX_PENDING.set(repo.count_outbox_open())
-    OUTBOX_DEAD.set(repo.count_outbox("dead"))
+    OUTBOX_DEAD.set(repo.count_outbox(OutboxStatus.DEAD))
 
 
 def process_batch(
@@ -64,7 +64,7 @@ def process_batch(
                 max_attempts=settings.dispatch_outbox_max_attempts,
                 backoff_base_seconds=2.0,
             )
-            OUTBOX_PROCESSED.labels(channel=row.channel, result="dead").inc()
+            OUTBOX_PROCESSED.labels(channel=row.channel, result=OutboxStatus.DEAD.value).inc()
             continue
 
         # Idempotent: skip if this key already succeeded in audit log
@@ -82,7 +82,7 @@ def process_batch(
         DISPATCH_ATTEMPTS.labels(channel=row.channel, success="true" if ok else "false").inc()
         if ok:
             repo.mark_outbox_sent(row.id)
-            OUTBOX_PROCESSED.labels(channel=row.channel, result="sent").inc()
+            OUTBOX_PROCESSED.labels(channel=row.channel, result=OutboxStatus.SENT.value).inc()
         else:
             err = (result.error_message if result else None) or "dispatch failed"
             final = repo.mark_outbox_result(
@@ -93,7 +93,12 @@ def process_batch(
                 backoff_base_seconds=2.0,
             )
             OUTBOX_PROCESSED.labels(
-                channel=row.channel, result="dead" if final == "dead" else "failed"
+                channel=row.channel,
+                result=(
+                    OutboxStatus.DEAD.value
+                    if final == OutboxStatus.DEAD.value
+                    else OutboxStatus.FAILED.value
+                ),
             ).inc()
 
     _refresh_outbox_gauges(repo)

@@ -6,23 +6,25 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_pipeline.alert_config import get_alert_config
 from alert_pipeline.cache.alert_cache import AlertReadCache
 from alert_pipeline.config import get_settings
-from alert_pipeline.db.models import AlertRecord, WidgetRecord
+from alert_pipeline.db.models import AlertRecord, DispatchOutbox, WidgetRecord
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
 from alert_pipeline.metrics import apply_status_timestamps
 from alert_pipeline.schemas import (
+    ACTIVE_ALERT_STATUS_VALUES,
+    OPERATOR_ALERT_STATUS_VALUES,
+    OUTBOX_OPEN_STATUS_VALUES,
     AlertEvent,
     AlertOut,
     AlertStatus,
@@ -30,6 +32,7 @@ from alert_pipeline.schemas import (
     DispatchOut,
     LogEvent,
     LogLevel,
+    OutboxStatus,
     StatsOut,
     StatsView,
 )
@@ -38,11 +41,24 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-AlertStatusLiteral = Literal["open", "updated", "acknowledged", "resolved"]
-
 
 class StatusBody(BaseModel):
-    status: AlertStatusLiteral
+    """Operator status transition (open/updated/acknowledged/resolved)."""
+
+    status: AlertStatus
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _operator_only(cls, v: object) -> object:
+        if v is None:
+            return v
+        try:
+            parsed = AlertStatus.parse(str(v))
+        except ValueError as exc:
+            raise ValueError(f"invalid status {v!r}") from exc
+        if parsed.value not in OPERATOR_ALERT_STATUS_VALUES:
+            raise ValueError(f"status {parsed.value!r} is not operator-settable")
+        return parsed
 
 
 class DemoFireBody(BaseModel):
@@ -94,7 +110,10 @@ class LabelSpec(BaseModel):
 class WidgetIn(BaseModel):
     title: str
     labels: list[LabelSpec] = Field(default_factory=list)
-    status_filter: str = "open,updated,acknowledged"
+    # Same set as ACTIVE_ALERT_STATUSES, stable display order.
+    status_filter: str = Field(
+        default=f"{AlertStatus.OPEN.value},{AlertStatus.UPDATED.value},{AlertStatus.ACKNOWLEDGED.value}"
+    )
     sort_order: int = 0
 
 
@@ -169,7 +188,7 @@ class OutboxIdsBody(BaseModel):
 
     ids: list[int] = Field(default_factory=list)
     all: bool = False
-    status: str = "dead"
+    status: OutboxStatus = OutboxStatus.DEAD
 
 
 class OutboxActionOut(BaseModel):
@@ -366,7 +385,7 @@ def create_app() -> FastAPI:
             has_prev=meta.has_prev,
         )
 
-    def _apply_status(alert_id: str, status: AlertStatusLiteral) -> AlertView:
+    def _apply_status(alert_id: str, status: AlertStatus) -> AlertView:
         with session_factory() as session:
             row = session.get(AlertRecord, alert_id)
             if row is None:
@@ -377,7 +396,7 @@ def create_app() -> FastAPI:
         cached = cache.get_alert(alert_id)
         if cached is None:
             raise HTTPException(status_code=404, detail="Alert not found after update")
-        logger.info("Alert %s set to %s (cache refreshed)", alert_id, status)
+        logger.info("Alert %s set to %s (cache refreshed)", alert_id, status.value)
         return cached
 
     @app.post("/api/alerts/{alert_id}/status", response_model=AlertOut)
@@ -386,15 +405,15 @@ def create_app() -> FastAPI:
 
     @app.post("/api/alerts/{alert_id}/ack", response_model=AlertOut)
     def acknowledge(alert_id: str) -> AlertView:
-        return _apply_status(alert_id, "acknowledged")
+        return _apply_status(alert_id, AlertStatus.ACKNOWLEDGED)
 
     @app.post("/api/alerts/{alert_id}/resolve", response_model=AlertOut)
     def resolve(alert_id: str) -> AlertView:
-        return _apply_status(alert_id, "resolved")
+        return _apply_status(alert_id, AlertStatus.RESOLVED)
 
     @app.post("/api/alerts/{alert_id}/reopen", response_model=AlertOut)
     def reopen(alert_id: str) -> AlertView:
-        return _apply_status(alert_id, "open")
+        return _apply_status(alert_id, AlertStatus.OPEN)
 
     @app.get("/api/services", response_model=list[str])
     def services() -> list[str]:
@@ -468,20 +487,27 @@ def create_app() -> FastAPI:
         return OutboxSummaryOut(
             counts=counts,
             open=repo.count_outbox_open(),
-            dead=int(counts.get("dead") or 0),
+            dead=int(counts.get(OutboxStatus.DEAD.value) or 0),
         )
 
     @app.get("/api/outbox", response_model=OutboxPageOut)
     def list_outbox(
         status: str | None = Query(
-            "dead",
+            OutboxStatus.DEAD.value,
             description="Filter by status; default dead. Use 'all' for every status.",
         ),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=200),
     ) -> OutboxPageOut:
         """List dispatch_outbox rows (default: dead-letter queue)."""
-        st = None if not status or status.lower() in ("all", "*") else status
+        st: OutboxStatus | str | None
+        if not status or status.lower() in ("all", "*"):
+            st = None
+        else:
+            try:
+                st = OutboxStatus.parse(status)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid outbox status: {status}") from exc
         total = repo.count_outbox(st)
         offset = (page - 1) * page_size
         rows = repo.list_outbox(status=st, limit=page_size, offset=offset)
@@ -515,24 +541,34 @@ def create_app() -> FastAPI:
     def redrive_outbox(body: OutboxIdsBody) -> OutboxActionOut:
         """Reset dead/failed outbox rows to pending for another worker attempt."""
         if body.all:
-            n = repo.redrive_outbox(status=body.status or "dead", all_matching=True)
+            n = repo.redrive_outbox(status=body.status, all_matching=True)
         else:
             if not body.ids:
                 raise HTTPException(status_code=400, detail="Provide ids or set all=true")
             n = repo.redrive_outbox(ids=body.ids, all_matching=False)
-        logger.info("Outbox redrive affected=%s all=%s status=%s", n, body.all, body.status)
+        logger.info(
+            "Outbox redrive affected=%s all=%s status=%s",
+            n,
+            body.all,
+            body.status.value,
+        )
         return OutboxActionOut(affected=n, action="redrive")
 
     @app.post("/api/outbox/clear", response_model=OutboxActionOut)
     def clear_outbox(body: OutboxIdsBody) -> OutboxActionOut:
         """Permanently delete outbox rows (default scope: dead)."""
         if body.all:
-            n = repo.delete_outbox(status=body.status or "dead", all_matching=True)
+            n = repo.delete_outbox(status=body.status, all_matching=True)
         else:
             if not body.ids:
                 raise HTTPException(status_code=400, detail="Provide ids or set all=true")
             n = repo.delete_outbox(ids=body.ids, all_matching=False)
-        logger.info("Outbox clear affected=%s all=%s status=%s", n, body.all, body.status)
+        logger.info(
+            "Outbox clear affected=%s all=%s status=%s",
+            n,
+            body.all,
+            body.status.value,
+        )
         return OutboxActionOut(affected=n, action="clear")
 
     @app.get("/api/dispatches/recent", response_model=DispatchPageOut)
@@ -576,9 +612,8 @@ def create_app() -> FastAPI:
         from datetime import datetime, timezone
         from uuid import uuid4
 
-        from sqlalchemy import select, update
+        from sqlalchemy import select
 
-        from alert_pipeline.db.models import DispatchOutbox
         from alert_pipeline.schemas import AlertEvent, AlertStatus, LogLevel
 
         if not _rate_limit_ok(_demo_fire_hits, limit=settings.demo_rate_limit_per_minute):
@@ -622,7 +657,7 @@ def create_app() -> FastAPI:
                     )
                 )
                 if row is not None:
-                    row.status = "dead"
+                    row.status = OutboxStatus.DEAD.value
                     row.attempts = max(1, settings.dispatch_outbox_max_attempts)
                     row.last_error = (
                         f"demo: simulated channel failure after max attempts (channel={channel})"
@@ -635,16 +670,16 @@ def create_app() -> FastAPI:
             with repo.session() as session:
                 result = session.execute(
                     update(DispatchOutbox)
-                    .where(DispatchOutbox.status.in_(("pending", "failed", "processing")))
+                    .where(DispatchOutbox.status.in_(tuple(OUTBOX_OPEN_STATUS_VALUES)))
                     .values(
-                        status="dead",
+                        status=OutboxStatus.DEAD.value,
                         last_error="demo: marked open outbox as dead for UI exercise",
                         updated_at=now,
                     )
                 )
                 marked_open = int(result.rowcount or 0)
 
-        dead_total = repo.count_outbox("dead")
+        dead_total = repo.count_outbox(OutboxStatus.DEAD)
         _touch_cache()
         logger.info(
             "Demo seed-dead-outbox created=%s marked_open=%s dead_total=%s",
@@ -671,7 +706,6 @@ def create_app() -> FastAPI:
             build_dispatchers,
             enabled_channel_names,
         )
-        from alert_pipeline.schemas import ACTIVE_ALERT_STATUSES
 
         if not _rate_limit_ok(_demo_fire_hits, limit=settings.demo_rate_limit_per_minute):
             raise HTTPException(status_code=429, detail="Demo fire rate limit exceeded")
@@ -697,7 +731,7 @@ def create_app() -> FastAPI:
             row = session.scalar(
                 select(AlertRecord).where(
                     AlertRecord.fingerprint == fp,
-                    AlertRecord.status.in_(tuple(ACTIVE_ALERT_STATUSES)),
+                    AlertRecord.status.in_(tuple(ACTIVE_ALERT_STATUS_VALUES)),
                 )
             )
             if row is not None:

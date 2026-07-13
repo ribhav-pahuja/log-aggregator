@@ -22,17 +22,29 @@ from alert_pipeline.db.models import (
     WidgetRecord,
 )
 from alert_pipeline.metrics import apply_status_timestamps
-from alert_pipeline.schemas import ACTIVE_ALERT_STATUSES, AlertEvent
+from alert_pipeline.schemas import (
+    ACTIVE_ALERT_STATUS_SQL,
+    ACTIVE_ALERT_STATUS_VALUES,
+    OPERATOR_ALERT_STATUS_VALUES,
+    OUTBOX_CLAIMABLE_STATUS_VALUES,
+    OUTBOX_OPEN_STATUS_VALUES,
+    OUTBOX_REDRIVE_STATUS_VALUES,
+    AlertEvent,
+    AlertStatus,
+    OutboxStatus,
+)
 
 logger = logging.getLogger(__name__)
 
-_ACTIVE = tuple(ACTIVE_ALERT_STATUSES)
-_OUTBOX_OPEN = ("pending", "processing", "failed")
+_ACTIVE = tuple(ACTIVE_ALERT_STATUS_VALUES)
+_OUTBOX_OPEN = tuple(OUTBOX_OPEN_STATUS_VALUES)
+_OUTBOX_CLAIMABLE = tuple(OUTBOX_CLAIMABLE_STATUS_VALUES)
+_OUTBOX_REDRIVE = tuple(OUTBOX_REDRIVE_STATUS_VALUES)
 
 # Partial unique index: at most one active incident per fingerprint.
-# Status list must match ACTIVE_ALERT_STATUSES.
+# WHERE clause derived from ACTIVE_ALERT_STATUS_SQL (same set as ACTIVE_ALERT_STATUSES).
 _ACTIVE_FP_INDEX = "uq_alerts_active_fingerprint"
-_ACTIVE_FP_WHERE = "status IN ('open', 'updated', 'acknowledged')"
+_ACTIVE_FP_WHERE = ACTIVE_ALERT_STATUS_SQL
 
 
 class AlertRepository:
@@ -156,7 +168,7 @@ class AlertRepository:
             row = session.scalar(
                 select(AlertRecord.id).where(
                     AlertRecord.fingerprint == fingerprint,
-                    AlertRecord.status == "resolved",
+                    AlertRecord.status == AlertStatus.RESOLVED.value,
                 )
             )
             return row is not None
@@ -193,16 +205,21 @@ class AlertRepository:
             row = session.get(AlertRecord, alert_id)
             return row.status if row else None
 
-    def set_alert_status(self, alert_id: str, status: str) -> AlertRecord | None:
+    def set_alert_status(
+        self, alert_id: str, status: AlertStatus | str
+    ) -> AlertRecord | None:
         """Operator actions: acknowledge / resolve / reopen — also persists TTA/TTR."""
-        allowed = {"open", "updated", "acknowledged", "resolved"}
-        if status not in allowed:
+        try:
+            parsed = AlertStatus.parse(status)
+        except ValueError as exc:
+            raise ValueError(f"invalid status {status!r}") from exc
+        if parsed.value not in OPERATOR_ALERT_STATUS_VALUES:
             raise ValueError(f"invalid status {status!r}")
         with self.session() as session:
             row = session.get(AlertRecord, alert_id)
             if row is None:
                 return None
-            apply_status_timestamps(row, status, now=datetime.now(timezone.utc))
+            apply_status_timestamps(row, parsed, now=datetime.now(timezone.utc))
             session.flush()
             session.refresh(row)
             session.expunge(row)
@@ -218,7 +235,7 @@ class AlertRepository:
             ).all()
             now = datetime.now(timezone.utc)
             for row in rows:
-                apply_status_timestamps(row, "resolved", now=now)
+                apply_status_timestamps(row, AlertStatus.RESOLVED, now=now)
 
     def clear_all(self) -> dict[str, int]:
         """Wipe alerts + dispatch audit + outbox (demo / empty slate)."""
@@ -302,7 +319,7 @@ class AlertRepository:
                     alert_id=alert.id,
                     channel=channel,
                     payload_json=payload,
-                    status="pending",
+                    status=OutboxStatus.PENDING.value,
                     attempts=0,
                     next_attempt_at=now,
                 )
@@ -322,8 +339,8 @@ class AlertRepository:
         Multi-worker safe (PostgreSQL):
         * ``SELECT … FOR UPDATE SKIP LOCKED`` so concurrent workers co-claim
           distinct rows without blocking each other.
-        * Compare-and-swap ``UPDATE … WHERE status IN ('pending','failed')`` so a
-          second worker never double-processes a row already claimed.
+        * Compare-and-swap ``UPDATE … WHERE status`` is claimable so a second
+          worker never double-processes a row already claimed.
         """
         now = datetime.now(timezone.utc)
         stale_before = now - timedelta(seconds=stale_processing_seconds)
@@ -332,16 +349,16 @@ class AlertRepository:
             session.execute(
                 update(DispatchOutbox)
                 .where(
-                    DispatchOutbox.status == "processing",
+                    DispatchOutbox.status == OutboxStatus.PROCESSING.value,
                     DispatchOutbox.updated_at < stale_before,
                 )
-                .values(status="pending", next_attempt_at=now)
+                .values(status=OutboxStatus.PENDING.value, next_attempt_at=now)
             )
 
             candidate_q = (
                 select(DispatchOutbox.id)
                 .where(
-                    DispatchOutbox.status.in_(("pending", "failed")),
+                    DispatchOutbox.status.in_(_OUTBOX_CLAIMABLE),
                     DispatchOutbox.next_attempt_at <= now,
                 )
                 .order_by(DispatchOutbox.next_attempt_at, DispatchOutbox.id)
@@ -361,11 +378,11 @@ class AlertRepository:
                     update(DispatchOutbox)
                     .where(
                         DispatchOutbox.id == oid,
-                        DispatchOutbox.status.in_(("pending", "failed")),
+                        DispatchOutbox.status.in_(_OUTBOX_CLAIMABLE),
                         DispatchOutbox.next_attempt_at <= now,
                     )
                     .values(
-                        status="processing",
+                        status=OutboxStatus.PROCESSING.value,
                         attempts=DispatchOutbox.attempts + 1,
                         updated_at=now,
                     )
@@ -385,7 +402,7 @@ class AlertRepository:
             row = session.get(DispatchOutbox, outbox_id)
             if row is None:
                 return
-            row.status = "sent"
+            row.status = OutboxStatus.SENT.value
             row.last_error = None
             row.updated_at = now
 
@@ -398,29 +415,29 @@ class AlertRepository:
         max_attempts: int,
         backoff_base_seconds: float = 2.0,
     ) -> str:
-        """Return final status: sent | failed | dead."""
+        """Return final status value: sent | failed | dead (or ``missing``)."""
         now = datetime.now(timezone.utc)
         with self.session() as session:
             row = session.get(DispatchOutbox, outbox_id)
             if row is None:
                 return "missing"
             if success:
-                row.status = "sent"
+                row.status = OutboxStatus.SENT.value
                 row.last_error = None
                 row.updated_at = now
-                return "sent"
+                return OutboxStatus.SENT.value
             attempts = int(row.attempts or 0)
             row.last_error = (error or "")[:2000] or None
             if attempts >= max_attempts:
-                row.status = "dead"
+                row.status = OutboxStatus.DEAD.value
                 row.updated_at = now
-                return "dead"
+                return OutboxStatus.DEAD.value
             # Exponential backoff: base^attempts seconds (capped)
             delay = min(300.0, backoff_base_seconds ** max(1, attempts))
-            row.status = "failed"
+            row.status = OutboxStatus.FAILED.value
             row.next_attempt_at = now + timedelta(seconds=delay)
             row.updated_at = now
-            return "failed"
+            return OutboxStatus.FAILED.value
 
     def dispatch_idempotency_succeeded(self, idempotency_key: str) -> bool:
         with self.session() as session:
@@ -443,14 +460,14 @@ class AlertRepository:
             )
             return int(n or 0)
 
-    def count_outbox(self, status: str | None = None) -> int:
+    def count_outbox(self, status: OutboxStatus | str | None = None) -> int:
         """Count outbox rows; optional exact status filter (e.g. ``dead``)."""
         with self.session() as session:
             from sqlalchemy import func
 
             q = select(func.count()).select_from(DispatchOutbox)
-            if status:
-                q = q.where(DispatchOutbox.status == status)
+            if status is not None:
+                q = q.where(DispatchOutbox.status == OutboxStatus.parse(status).value)
             return int(session.scalar(q) or 0)
 
     def outbox_status_counts(self) -> dict[str, int]:
@@ -466,7 +483,7 @@ class AlertRepository:
     def list_outbox(
         self,
         *,
-        status: str | None = None,
+        status: OutboxStatus | str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[DispatchOutbox]:
@@ -477,8 +494,8 @@ class AlertRepository:
             q = select(DispatchOutbox).order_by(
                 DispatchOutbox.updated_at.desc(), DispatchOutbox.id.desc()
             )
-            if status:
-                q = q.where(DispatchOutbox.status == status)
+            if status is not None:
+                q = q.where(DispatchOutbox.status == OutboxStatus.parse(status).value)
             rows = list(session.scalars(q.offset(offset).limit(limit)).all())
             for r in rows:
                 session.expunge(r)
@@ -488,7 +505,7 @@ class AlertRepository:
         self,
         *,
         ids: list[int] | None = None,
-        status: str = "dead",
+        status: OutboxStatus | str = OutboxStatus.DEAD,
         all_matching: bool = False,
     ) -> int:
         """Reset outbox rows to ``pending`` for another worker attempt.
@@ -499,19 +516,20 @@ class AlertRepository:
         """
         if not all_matching and not ids:
             return 0
+        status_value = OutboxStatus.parse(status).value
         now = datetime.now(timezone.utc)
         with self.session() as session:
             q = select(DispatchOutbox)
             if all_matching:
-                q = q.where(DispatchOutbox.status == status)
+                q = q.where(DispatchOutbox.status == status_value)
             else:
                 q = q.where(
                     DispatchOutbox.id.in_(list(ids or [])),
-                    DispatchOutbox.status.in_(("dead", "failed")),
+                    DispatchOutbox.status.in_(_OUTBOX_REDRIVE),
                 )
             rows = list(session.scalars(q).all())
             for row in rows:
-                row.status = "pending"
+                row.status = OutboxStatus.PENDING.value
                 row.attempts = 0
                 row.next_attempt_at = now
                 row.last_error = None
@@ -523,16 +541,17 @@ class AlertRepository:
         self,
         *,
         ids: list[int] | None = None,
-        status: str = "dead",
+        status: OutboxStatus | str = OutboxStatus.DEAD,
         all_matching: bool = False,
     ) -> int:
         """Permanently delete outbox rows (typically dead-letter discard)."""
         if not all_matching and not ids:
             return 0
+        status_value = OutboxStatus.parse(status).value
         with self.session() as session:
             if all_matching:
                 result = session.execute(
-                    delete(DispatchOutbox).where(DispatchOutbox.status == status)
+                    delete(DispatchOutbox).where(DispatchOutbox.status == status_value)
                 )
             else:
                 result = session.execute(

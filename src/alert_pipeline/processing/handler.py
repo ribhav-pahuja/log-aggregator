@@ -24,7 +24,7 @@ from alert_pipeline.dispatchers.registry import (
     enabled_channel_names,
 )
 from alert_pipeline.observability import ALERTS_EMITTED, ALERTS_SKIPPED, OUTBOX_ENQUEUED
-from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, LogEvent, LogLevel
+from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, AlertStatus, LogEvent, LogLevel
 from alert_pipeline.types import JsonObject, JsonValue, ProcessResultDict
 from alert_pipeline.ui_cache_invalidate import invalidate_ui_snapshot
 
@@ -232,7 +232,11 @@ class AlertProcessor:
         def _should_enqueue(record: object, al: AlertEvent) -> bool:
             # Suppress refire notifications while operator has acked the incident.
             status = getattr(record, "status", None)
-            if not al.is_new and suppress_while_acked and status == "acknowledged":
+            if (
+                not al.is_new
+                and suppress_while_acked
+                and status == AlertStatus.ACKNOWLEDGED.value
+            ):
                 return False
             return True
 
@@ -255,7 +259,11 @@ class AlertProcessor:
             )
 
         dispatch_suppressed = False
-        if not alert.is_new and suppress_while_acked and record.status == "acknowledged":
+        if (
+            not alert.is_new
+            and suppress_while_acked
+            and record.status == AlertStatus.ACKNOWLEDGED.value
+        ):
             dispatch_suppressed = True
             logger.info(
                 "Skip dispatch for acked incident %s (refire suppressed by YAML)",

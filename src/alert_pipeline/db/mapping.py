@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from alert_pipeline.db.models import AlertRecord, DispatchLog
-from alert_pipeline.schemas import AlertEvent, AlertView, DispatchView
+from alert_pipeline.schemas import AlertEvent, AlertStatus, AlertView, DispatchView
 
 
 def parse_labels_json(raw: str | None) -> dict[str, str]:
@@ -55,8 +55,8 @@ def apply_event_to_record(record: AlertRecord, alert: AlertEvent) -> None:
         record.occurrence_count = alert.occurrence_count
 
     record.last_seen = alert.last_seen
-    if record.status != "acknowledged":
-        record.status = "updated"
+    if record.status != AlertStatus.ACKNOWLEDGED.value:
+        record.status = AlertStatus.UPDATED.value
     record.severity = (
         alert.severity.value if hasattr(alert.severity, "value") else str(alert.severity)
     )

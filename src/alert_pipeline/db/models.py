@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from alert_pipeline.schemas import AlertStatus, OutboxStatus
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -32,7 +34,9 @@ class AlertRecord(Base):
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
     service: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     host: Mapped[str] = mapped_column(String(256), nullable=False, default="unknown")
-    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="open")
+    status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, default=AlertStatus.OPEN.value
+    )
     occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -91,8 +95,10 @@ class DispatchOutbox(Base):
     channel: Mapped[str] = mapped_column(String(64), nullable=False)
     # Full AlertEvent JSON for the dispatcher
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    # pending | processing | sent | failed | dead
-    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="pending")
+    # See :class:`OutboxStatus` (pending | processing | sent | failed | dead).
+    status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, default=OutboxStatus.PENDING.value
+    )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False, index=True
