@@ -1,4 +1,14 @@
-"""Pydantic models for logs, alerts, and dispatch payloads."""
+"""Pydantic models for logs, alerts, and operator read views.
+
+Layering
+--------
+* :class:`LogEvent` — normalized Kafka log input
+* :class:`AlertEvent` — pipeline **write** model (dedup emit → DB → dispatch)
+* :class:`AlertView` — operator **read** model (DB → UI cache → HTTP API)
+
+``CachedAlert`` / ``AlertOut`` are aliases of :class:`AlertView` so cache and
+API cannot drift. ORM conversion lives in ``alert_pipeline.db.mapping``.
+"""
 
 from __future__ import annotations
 
@@ -142,7 +152,12 @@ ACTIVE_ALERT_STATUSES = frozenset(
 
 
 class AlertEvent(BaseModel):
-    """Deduplicated alert / incident emitted by the pipeline."""
+    """Pipeline write model — emitted by dedup, persisted, and dispatched.
+
+    Distinct from :class:`AlertView` (operator read model). This shape carries
+    ``is_new`` and typed severity/status enums for the emit path; it does not
+    include operator timeline fields (ack/resolve/TTA/TTR) or dispatch counts.
+    """
 
     id: str = Field(default_factory=lambda: str(uuid4()))
     fingerprint: str
@@ -163,3 +178,93 @@ class AlertEvent(BaseModel):
 
     def to_dispatch_dict(self) -> JsonObject:
         return cast(JsonObject, self.model_dump(mode="json"))
+
+
+class AlertView(BaseModel):
+    """Single operator-facing incident shape (UI cache, Redis snapshot, HTTP API).
+
+    Field list is the source of truth for anything that *reads* an alert after
+    persistence. Convert from ORM via ``alert_pipeline.db.mapping.alert_view_from_record``.
+    """
+
+    id: str
+    fingerprint: str
+    title: str
+    description: str = ""
+    severity: str
+    service: str
+    host: str = "unknown"
+    status: str
+    occurrence_count: int = 1
+    first_seen: datetime
+    last_seen: datetime
+    error_code: str | None = None
+    trace_id: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    sample_message: str = ""
+    acknowledged_at: datetime | None = None
+    resolved_at: datetime | None = None
+    tta_seconds: int | None = None
+    ttr_seconds: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    dispatch_success: int = 0
+    dispatch_failed: int = 0
+
+    def to_jsonable(self) -> JsonObject:
+        """Redis / wire-safe dict (ISO datetimes)."""
+        return cast(JsonObject, self.model_dump(mode="json"))
+
+    @classmethod
+    def from_jsonable(cls, data: dict[str, object] | JsonObject) -> "AlertView":
+        return cls.model_validate(data)
+
+
+class DispatchView(BaseModel):
+    """Single dispatch-audit shape (UI cache + HTTP API)."""
+
+    id: int
+    alert_id: str
+    channel: str
+    success: bool
+    status_code: int | None = None
+    error_message: str | None = None
+    created_at: datetime
+
+    def to_jsonable(self) -> JsonObject:
+        return cast(JsonObject, self.model_dump(mode="json"))
+
+    @classmethod
+    def from_jsonable(cls, data: dict[str, object] | JsonObject) -> "DispatchView":
+        return cls.model_validate(data)
+
+
+class StatsView(BaseModel):
+    """Dashboard aggregate stats (UI cache + HTTP API)."""
+
+    total: int = 0
+    open: int = 0
+    updated: int = 0
+    acknowledged: int = 0
+    resolved: int = 0
+    critical_or_error: int = 0
+    services: int = 0
+    dispatches_ok: int = 0
+    dispatches_fail: int = 0
+    last_alert_at: datetime | None = None
+
+    def to_jsonable(self) -> JsonObject:
+        return cast(JsonObject, self.model_dump(mode="json"))
+
+    @classmethod
+    def from_jsonable(cls, data: dict[str, object] | JsonObject) -> "StatsView":
+        return cls.model_validate(data)
+
+
+# Historical names — same types so cache/API/tests cannot diverge.
+CachedAlert = AlertView
+CachedDispatch = DispatchView
+CachedStats = StatsView
+AlertOut = AlertView
+DispatchOut = DispatchView
+StatsOut = StatsView

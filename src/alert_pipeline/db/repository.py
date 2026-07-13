@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from alert_pipeline.db.mapping import alert_record_from_event, apply_event_to_record
 from alert_pipeline.db.models import (
     AlertRecord,
     DispatchLog,
@@ -173,41 +174,13 @@ class AlertRepository:
             if by_id is not None:
                 alert.id = str(uuid.uuid4())
                 alert.is_new = True
-            record = AlertRecord(
-                id=alert.id,
-                fingerprint=alert.fingerprint,
-                title=alert.title,
-                description=alert.description,
-                severity=alert.severity.value,
-                service=alert.service,
-                host=alert.host,
-                status=alert.status.value,
-                occurrence_count=alert.occurrence_count,
-                first_seen=alert.first_seen,
-                last_seen=alert.last_seen,
-                error_code=alert.error_code,
-                trace_id=alert.trace_id,
-                labels_json=json.dumps(alert.labels),
-                sample_message=alert.sample_message,
-            )
+            record = alert_record_from_event(alert)
             session.add(record)
             session.flush()
             session.expunge(record)
             return record
 
-        # Never decrease counts (restart / multi-worker safety)
-        if alert.is_new or alert.occurrence_count <= existing.occurrence_count:
-            existing.occurrence_count = existing.occurrence_count + 1
-        else:
-            existing.occurrence_count = alert.occurrence_count
-
-        existing.last_seen = alert.last_seen
-        if existing.status != "acknowledged":
-            existing.status = "updated"
-        existing.severity = alert.severity.value
-        existing.sample_message = alert.sample_message or existing.sample_message
-        if alert.trace_id:
-            existing.trace_id = alert.trace_id
+        apply_event_to_record(existing, alert)
         session.flush()
         alert.id = existing.id
         alert.is_new = False

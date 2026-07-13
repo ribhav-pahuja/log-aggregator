@@ -16,14 +16,22 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from typing import Generic, TypeVar, cast
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from alert_pipeline.db.mapping import alert_view_from_record, dispatch_view_from_log
 from alert_pipeline.db.models import AlertRecord, DispatchLog
+from alert_pipeline.schemas import (
+    AlertView,
+    CachedAlert,
+    CachedDispatch,
+    CachedStats,
+    DispatchView,
+    StatsView,
+)
 from alert_pipeline.types import CacheMeta, JsonObject
 
 logger = logging.getLogger(__name__)
@@ -31,207 +39,17 @@ logger = logging.getLogger(__name__)
 REDIS_SNAPSHOT_KEY = "alert_ui:snapshot"
 REDIS_LOCK_KEY = "alert_ui:snapshot:lock"
 
-
-def _dt_to_iso(v: datetime | None) -> str | None:
-    if v is None:
-        return None
-    if v.tzinfo is None:
-        v = v.replace(tzinfo=timezone.utc)
-    return v.isoformat()
-
-
-def _iso_to_dt(v: str | None) -> datetime | None:
-    if not v:
-        return None
-    return datetime.fromisoformat(v.replace("Z", "+00:00"))
-
-
-@dataclass
-class CachedAlert:
-    id: str
-    fingerprint: str
-    title: str
-    description: str
-    severity: str
-    service: str
-    host: str
-    status: str
-    occurrence_count: int
-    first_seen: datetime
-    last_seen: datetime
-    error_code: str | None
-    trace_id: str | None
-    labels: dict[str, str]
-    sample_message: str
-    acknowledged_at: datetime | None
-    resolved_at: datetime | None
-    tta_seconds: int | None
-    ttr_seconds: int | None
-    created_at: datetime | None
-    updated_at: datetime | None
-    dispatch_success: int = 0
-    dispatch_failed: int = 0
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "fingerprint": self.fingerprint,
-            "title": self.title,
-            "description": self.description,
-            "severity": self.severity,
-            "service": self.service,
-            "host": self.host,
-            "status": self.status,
-            "occurrence_count": self.occurrence_count,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "error_code": self.error_code,
-            "trace_id": self.trace_id,
-            "labels": self.labels,
-            "sample_message": self.sample_message,
-            "acknowledged_at": self.acknowledged_at,
-            "resolved_at": self.resolved_at,
-            "tta_seconds": self.tta_seconds,
-            "ttr_seconds": self.ttr_seconds,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "dispatch_success": self.dispatch_success,
-            "dispatch_failed": self.dispatch_failed,
-        }
-
-    def to_jsonable(self) -> JsonObject:
-        d = self.as_dict()
-        out: JsonObject = {}
-        for k, v in d.items():
-            if k in (
-                "first_seen",
-                "last_seen",
-                "acknowledged_at",
-                "resolved_at",
-                "created_at",
-                "updated_at",
-            ):
-                out[k] = _dt_to_iso(v if isinstance(v, datetime) else None)
-            elif isinstance(v, (str, int, float, bool)) or v is None:
-                out[k] = v
-            elif isinstance(v, dict):
-                out[k] = {str(dk): str(dv) for dk, dv in v.items()}
-            else:
-                out[k] = str(v)
-        return out
-
-    @classmethod
-    def from_jsonable(cls, d: JsonObject) -> "CachedAlert":
-        labels_raw = d.get("labels") or {}
-        labels = (
-            {str(k): str(v) for k, v in labels_raw.items()}
-            if isinstance(labels_raw, dict)
-            else {}
-        )
-        tta = d.get("tta_seconds")
-        ttr = d.get("ttr_seconds")
-        return cls(
-            id=str(d["id"]),
-            fingerprint=str(d["fingerprint"]),
-            title=str(d["title"]),
-            description=str(d.get("description") or ""),
-            severity=str(d["severity"]),
-            service=str(d["service"]),
-            host=str(d.get("host") or "unknown"),
-            status=str(d["status"]),
-            occurrence_count=int(d.get("occurrence_count") or 1),
-            first_seen=_iso_to_dt(str(d["first_seen"]) if d.get("first_seen") else None)
-            or datetime.now(timezone.utc),
-            last_seen=_iso_to_dt(str(d["last_seen"]) if d.get("last_seen") else None)
-            or datetime.now(timezone.utc),
-            error_code=None if d.get("error_code") is None else str(d.get("error_code")),
-            trace_id=None if d.get("trace_id") is None else str(d.get("trace_id")),
-            labels=labels,
-            sample_message=str(d.get("sample_message") or ""),
-            acknowledged_at=_iso_to_dt(
-                str(d["acknowledged_at"]) if d.get("acknowledged_at") else None
-            ),
-            resolved_at=_iso_to_dt(str(d["resolved_at"]) if d.get("resolved_at") else None),
-            tta_seconds=int(tta) if isinstance(tta, (int, float)) else None,
-            ttr_seconds=int(ttr) if isinstance(ttr, (int, float)) else None,
-            created_at=_iso_to_dt(str(d["created_at"]) if d.get("created_at") else None),
-            updated_at=_iso_to_dt(str(d["updated_at"]) if d.get("updated_at") else None),
-            dispatch_success=int(d.get("dispatch_success") or 0),
-            dispatch_failed=int(d.get("dispatch_failed") or 0),
-        )
-
-
-@dataclass
-class CachedDispatch:
-    id: int
-    alert_id: str
-    channel: str
-    success: bool
-    status_code: int | None
-    error_message: str | None
-    created_at: datetime
-
-    def to_jsonable(self) -> JsonObject:
-        return {
-            "id": self.id,
-            "alert_id": self.alert_id,
-            "channel": self.channel,
-            "success": self.success,
-            "status_code": self.status_code,
-            "error_message": self.error_message,
-            "created_at": _dt_to_iso(self.created_at),
-        }
-
-    @classmethod
-    def from_jsonable(cls, d: JsonObject) -> "CachedDispatch":
-        status_code = d.get("status_code")
-        err = d.get("error_message")
-        return cls(
-            id=int(d["id"]),  # type: ignore[arg-type]
-            alert_id=str(d["alert_id"]),
-            channel=str(d["channel"]),
-            success=bool(d["success"]),
-            status_code=int(status_code) if isinstance(status_code, (int, float)) else None,
-            error_message=None if err is None else str(err),
-            created_at=_iso_to_dt(str(d["created_at"]) if d.get("created_at") else None)
-            or datetime.now(timezone.utc),
-        )
-
-
-@dataclass
-class CachedStats:
-    total: int = 0
-    open: int = 0
-    updated: int = 0
-    acknowledged: int = 0
-    resolved: int = 0
-    critical_or_error: int = 0
-    services: int = 0
-    dispatches_ok: int = 0
-    dispatches_fail: int = 0
-    last_alert_at: datetime | None = None
-
-    def to_jsonable(self) -> JsonObject:
-        d = asdict(self)
-        d["last_alert_at"] = _dt_to_iso(self.last_alert_at)
-        return cast(JsonObject, d)
-
-    @classmethod
-    def from_jsonable(cls, d: JsonObject) -> "CachedStats":
-        last = d.get("last_alert_at")
-        return cls(
-            total=int(d.get("total") or 0),
-            open=int(d.get("open") or 0),
-            updated=int(d.get("updated") or 0),
-            acknowledged=int(d.get("acknowledged") or 0),
-            resolved=int(d.get("resolved") or 0),
-            critical_or_error=int(d.get("critical_or_error") or 0),
-            services=int(d.get("services") or 0),
-            dispatches_ok=int(d.get("dispatches_ok") or 0),
-            dispatches_fail=int(d.get("dispatches_fail") or 0),
-            last_alert_at=_iso_to_dt(str(last) if last else None),
-        )
-
+# Re-export shared view types so existing imports keep working.
+__all__ = [
+    "AlertReadCache",
+    "AlertView",
+    "CachedAlert",
+    "CachedDispatch",
+    "CachedStats",
+    "DispatchView",
+    "Page",
+    "StatsView",
+]
 
 T = TypeVar("T")
 
@@ -262,11 +80,11 @@ class Page(Generic[T]):
 
 @dataclass
 class _Snapshot:
-    alerts: dict[str, CachedAlert] = field(default_factory=dict)
-    dispatches: dict[str, list[CachedDispatch]] = field(default_factory=dict)
-    recent_dispatches: list[CachedDispatch] = field(default_factory=list)
+    alerts: dict[str, AlertView] = field(default_factory=dict)
+    dispatches: dict[str, list[DispatchView]] = field(default_factory=dict)
+    recent_dispatches: list[DispatchView] = field(default_factory=list)
     services: list[str] = field(default_factory=list)
-    stats: CachedStats = field(default_factory=CachedStats)
+    stats: StatsView = field(default_factory=StatsView)
     loaded_at_unix: float = 0.0
     expires_at_unix: float = 0.0
     generation: int = 0
@@ -291,35 +109,35 @@ class _Snapshot:
         services_raw = data.get("services") or []
         stats_raw = data.get("stats") or {}
 
-        alerts: dict[str, CachedAlert] = {}
+        alerts: dict[str, AlertView] = {}
         if isinstance(alerts_raw, dict):
             for k, v in alerts_raw.items():
                 if isinstance(v, dict):
-                    alerts[str(k)] = CachedAlert.from_jsonable(cast(JsonObject, v))
+                    alerts[str(k)] = AlertView.from_jsonable(cast(JsonObject, v))
 
-        dispatches: dict[str, list[CachedDispatch]] = {}
+        dispatches: dict[str, list[DispatchView]] = {}
         if isinstance(dispatches_raw, dict):
             for k, v in dispatches_raw.items():
                 if isinstance(v, list):
                     dispatches[str(k)] = [
-                        CachedDispatch.from_jsonable(cast(JsonObject, x))
+                        DispatchView.from_jsonable(cast(JsonObject, x))
                         for x in v
                         if isinstance(x, dict)
                     ]
 
-        recent: list[CachedDispatch] = []
+        recent: list[DispatchView] = []
         if isinstance(recent_raw, list):
             recent = [
-                CachedDispatch.from_jsonable(cast(JsonObject, x))
+                DispatchView.from_jsonable(cast(JsonObject, x))
                 for x in recent_raw
                 if isinstance(x, dict)
             ]
 
         services = [str(s) for s in services_raw] if isinstance(services_raw, list) else []
         stats = (
-            CachedStats.from_jsonable(cast(JsonObject, stats_raw))
+            StatsView.from_jsonable(cast(JsonObject, stats_raw))
             if isinstance(stats_raw, dict)
-            else CachedStats()
+            else StatsView()
         )
         return cls(
             alerts=alerts,
@@ -331,41 +149,6 @@ class _Snapshot:
             expires_at_unix=float(data.get("expires_at_unix") or 0),
             generation=int(data.get("generation") or 0),
         )
-
-
-def _row_to_cached(row: AlertRecord, ok: int = 0, fail: int = 0) -> CachedAlert:
-    try:
-        labels = json.loads(row.labels_json or "{}")
-        if not isinstance(labels, dict):
-            labels = {}
-        labels = {str(k): str(v) for k, v in labels.items()}
-    except json.JSONDecodeError:
-        labels = {}
-    return CachedAlert(
-        id=row.id,
-        fingerprint=row.fingerprint,
-        title=row.title,
-        description=row.description,
-        severity=row.severity,
-        service=row.service,
-        host=row.host,
-        status=row.status,
-        occurrence_count=row.occurrence_count,
-        first_seen=row.first_seen,
-        last_seen=row.last_seen,
-        error_code=row.error_code,
-        trace_id=row.trace_id,
-        labels=labels,
-        sample_message=row.sample_message,
-        acknowledged_at=getattr(row, "acknowledged_at", None),
-        resolved_at=getattr(row, "resolved_at", None),
-        tta_seconds=getattr(row, "tta_seconds", None),
-        ttr_seconds=getattr(row, "ttr_seconds", None),
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-        dispatch_success=ok,
-        dispatch_failed=fail,
-    )
 
 
 class AlertReadCache:
@@ -568,7 +351,11 @@ class AlertReadCache:
                         fail_map[alert_id] = int(cnt)
 
             for r in rows:
-                snap.alerts[r.id] = _row_to_cached(r, ok_map.get(r.id, 0), fail_map.get(r.id, 0))
+                snap.alerts[r.id] = alert_view_from_record(
+                    r,
+                    dispatch_success=ok_map.get(r.id, 0),
+                    dispatch_failed=fail_map.get(r.id, 0),
+                )
 
             if ids:
                 drows = session.scalars(
@@ -581,35 +368,14 @@ class AlertReadCache:
                     bucket = snap.dispatches.setdefault(d.alert_id, [])
                     if len(bucket) >= self.max_dispatches_per_alert:
                         continue
-                    bucket.append(
-                        CachedDispatch(
-                            id=d.id,
-                            alert_id=d.alert_id,
-                            channel=d.channel,
-                            success=bool(d.success),
-                            status_code=d.status_code,
-                            error_message=d.error_message,
-                            created_at=d.created_at,
-                        )
-                    )
+                    bucket.append(dispatch_view_from_log(d))
 
             recent = session.scalars(
                 select(DispatchLog)
                 .order_by(desc(DispatchLog.created_at))
                 .limit(self.max_recent_dispatches)
             ).all()
-            snap.recent_dispatches = [
-                CachedDispatch(
-                    id=d.id,
-                    alert_id=d.alert_id,
-                    channel=d.channel,
-                    success=bool(d.success),
-                    status_code=d.status_code,
-                    error_message=d.error_message,
-                    created_at=d.created_at,
-                )
-                for d in recent
-            ]
+            snap.recent_dispatches = [dispatch_view_from_log(d) for d in recent]
 
             services = session.scalars(
                 select(AlertRecord.service).distinct().order_by(AlertRecord.service)
@@ -648,7 +414,7 @@ class AlertReadCache:
                 or 0
             )
             last_at = session.scalar(select(func.max(AlertRecord.last_seen)))
-            snap.stats = CachedStats(
+            snap.stats = StatsView(
                 total=total,
                 open=_count("open"),
                 updated=_count("updated"),
@@ -750,13 +516,13 @@ class AlertReadCache:
 
     # --- query API (all from snapshot; pagination in-process on cached set) -
 
-    def stats(self) -> CachedStats:
+    def stats(self) -> StatsView:
         return self._ensure_fresh().stats
 
     def list_services(self) -> list[str]:
         return list(self._ensure_fresh().services)
 
-    def get_alert(self, alert_id: str) -> CachedAlert | None:
+    def get_alert(self, alert_id: str) -> AlertView | None:
         return self._ensure_fresh().alerts.get(alert_id)
 
     def _filtered_alerts(
@@ -769,7 +535,7 @@ class AlertReadCache:
         label_key: str | None = None,
         label_value: str | None = None,
         labels: list[dict[str, str]] | None = None,
-    ) -> list[CachedAlert]:
+    ) -> list[AlertView]:
         snap = self._ensure_fresh()
         items = list(snap.alerts.values())
         # Newest activity first (last_seen desc; ties use first_seen)
@@ -802,7 +568,7 @@ class AlertReadCache:
 
         if label_specs:
 
-            def all_labels_match(a: CachedAlert) -> bool:
+            def all_labels_match(a: AlertView) -> bool:
                 al = {str(k).lower(): str(v).lower() for k, v in (a.labels or {}).items()}
                 for lk, lv in label_specs:
                     if lk not in al:
@@ -815,7 +581,7 @@ class AlertReadCache:
         if q:
             needle = q.lower()
 
-            def match(a: CachedAlert) -> bool:
+            def match(a: AlertView) -> bool:
                 blob = " ".join(
                     [
                         a.title or "",
@@ -842,7 +608,7 @@ class AlertReadCache:
         labels: list[dict[str, str]] | None = None,
         page: int = 1,
         page_size: int = 10,
-    ) -> Page[CachedAlert]:
+    ) -> Page[AlertView]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         items = self._filtered_alerts(
@@ -861,7 +627,7 @@ class AlertReadCache:
 
     def alert_dispatches_page(
         self, alert_id: str, *, page: int = 1, page_size: int = 50
-    ) -> Page[CachedDispatch]:
+    ) -> Page[DispatchView]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         snap = self._ensure_fresh()
@@ -875,7 +641,7 @@ class AlertReadCache:
             page_size=page_size,
         )
 
-    def recent_dispatches_page(self, *, page: int = 1, page_size: int = 30) -> Page[CachedDispatch]:
+    def recent_dispatches_page(self, *, page: int = 1, page_size: int = 30) -> Page[DispatchView]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         rows = list(self._ensure_fresh().recent_dispatches)
@@ -903,7 +669,7 @@ class AlertReadCache:
         page_size: int = 10,
         limit: int | None = None,
         offset: int | None = None,
-    ) -> list[CachedAlert]:
+    ) -> list[AlertView]:
         # legacy limit/offset
         if limit is not None or offset is not None:
             page_size = int(limit if limit is not None else page_size)
@@ -921,10 +687,10 @@ class AlertReadCache:
             page_size=page_size,
         ).items
 
-    def alert_dispatches(self, alert_id: str, limit: int = 50) -> list[CachedDispatch]:
+    def alert_dispatches(self, alert_id: str, limit: int = 50) -> list[DispatchView]:
         return self.alert_dispatches_page(alert_id, page=1, page_size=limit).items
 
-    def recent_dispatches(self, limit: int = 30) -> list[CachedDispatch]:
+    def recent_dispatches(self, limit: int = 30) -> list[DispatchView]:
         return self.recent_dispatches_page(page=1, page_size=limit).items
 
     def meta(self) -> CacheMeta:

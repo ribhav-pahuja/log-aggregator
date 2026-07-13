@@ -16,68 +16,29 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_pipeline.alert_config import get_alert_config
-from alert_pipeline.cache.alert_cache import AlertReadCache, CachedAlert, CachedDispatch
+from alert_pipeline.cache.alert_cache import AlertReadCache
 from alert_pipeline.config import get_settings
 from alert_pipeline.db.models import AlertRecord, WidgetRecord
 from alert_pipeline.db.repository import AlertRepository
 from alert_pipeline.dedup.fingerprint import build_title, compute_fingerprint
 from alert_pipeline.metrics import apply_status_timestamps
-from alert_pipeline.schemas import AlertEvent, AlertStatus, LogEvent, LogLevel
+from alert_pipeline.schemas import (
+    AlertEvent,
+    AlertOut,
+    AlertStatus,
+    AlertView,
+    DispatchOut,
+    LogEvent,
+    LogLevel,
+    StatsOut,
+    StatsView,
+)
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 AlertStatusLiteral = Literal["open", "updated", "acknowledged", "resolved"]
-
-
-class AlertOut(BaseModel):
-    id: str
-    fingerprint: str
-    title: str
-    description: str
-    severity: str
-    service: str
-    host: str
-    status: str
-    occurrence_count: int
-    first_seen: datetime
-    last_seen: datetime
-    error_code: str | None
-    trace_id: str | None
-    labels: dict[str, str] = Field(default_factory=dict)
-    sample_message: str
-    acknowledged_at: datetime | None = None
-    resolved_at: datetime | None = None
-    tta_seconds: int | None = None
-    ttr_seconds: int | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    dispatch_success: int = 0
-    dispatch_failed: int = 0
-
-
-class DispatchOut(BaseModel):
-    id: int
-    alert_id: str
-    channel: str
-    success: bool
-    status_code: int | None
-    error_message: str | None
-    created_at: datetime
-
-
-class StatsOut(BaseModel):
-    total: int
-    open: int
-    updated: int
-    acknowledged: int
-    resolved: int
-    critical_or_error: int
-    services: int
-    dispatches_ok: int
-    dispatches_fail: int
-    last_alert_at: datetime | None
 
 
 class StatusBody(BaseModel):
@@ -228,22 +189,6 @@ def _page_meta(page, page_size, total) -> PageMeta:
     )
 
 
-def _alert_out(c: CachedAlert) -> AlertOut:
-    return AlertOut.model_validate(c.as_dict())
-
-
-def _dispatch_out(d: CachedDispatch) -> DispatchOut:
-    return DispatchOut(
-        id=d.id,
-        alert_id=d.alert_id,
-        channel=d.channel,
-        success=d.success,
-        status_code=d.status_code,
-        error_message=d.error_message,
-        created_at=d.created_at,
-    )
-
-
 def _rate_limit_ok(bucket: list[float], *, limit: int, window_seconds: float = 60.0) -> bool:
     """Simple process-local sliding window. Returns True if request is allowed."""
     import time as _time
@@ -329,20 +274,8 @@ def create_app() -> FastAPI:
         return FileResponse(index_path)
 
     @app.get("/api/stats", response_model=StatsOut)
-    def stats() -> StatsOut:
-        s = cache.stats()
-        return StatsOut(
-            total=s.total,
-            open=s.open,
-            updated=s.updated,
-            acknowledged=s.acknowledged,
-            resolved=s.resolved,
-            critical_or_error=s.critical_or_error,
-            services=s.services,
-            dispatches_ok=s.dispatches_ok,
-            dispatches_fail=s.dispatches_fail,
-            last_alert_at=s.last_alert_at,
-        )
+    def stats() -> StatsView:
+        return cache.stats()
 
     @app.get("/api/alerts", response_model=AlertPageOut)
     def list_alerts(
@@ -396,7 +329,7 @@ def create_app() -> FastAPI:
         )
         meta = _page_meta(pg.page, pg.page_size, pg.total)
         return AlertPageOut(
-            items=[_alert_out(a) for a in pg.items],
+            items=list(pg.items),
             page=meta.page,
             page_size=meta.page_size,
             total=meta.total,
@@ -406,11 +339,11 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/alerts/{alert_id}", response_model=AlertOut)
-    def get_alert(alert_id: str) -> AlertOut:
+    def get_alert(alert_id: str) -> AlertView:
         row = cache.get_alert(alert_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Alert not found")
-        return _alert_out(row)
+        return row
 
     @app.get("/api/alerts/{alert_id}/dispatches", response_model=DispatchPageOut)
     def alert_dispatches(
@@ -424,7 +357,7 @@ def create_app() -> FastAPI:
         pg = cache.alert_dispatches_page(alert_id, page=page, page_size=page_size)
         meta = _page_meta(pg.page, pg.page_size, pg.total)
         return DispatchPageOut(
-            items=[_dispatch_out(d) for d in pg.items],
+            items=list(pg.items),
             page=meta.page,
             page_size=meta.page_size,
             total=meta.total,
@@ -433,7 +366,7 @@ def create_app() -> FastAPI:
             has_prev=meta.has_prev,
         )
 
-    def _apply_status(alert_id: str, status: AlertStatusLiteral) -> AlertOut:
+    def _apply_status(alert_id: str, status: AlertStatusLiteral) -> AlertView:
         with session_factory() as session:
             row = session.get(AlertRecord, alert_id)
             if row is None:
@@ -445,22 +378,22 @@ def create_app() -> FastAPI:
         if cached is None:
             raise HTTPException(status_code=404, detail="Alert not found after update")
         logger.info("Alert %s set to %s (cache refreshed)", alert_id, status)
-        return _alert_out(cached)
+        return cached
 
     @app.post("/api/alerts/{alert_id}/status", response_model=AlertOut)
-    def set_status(alert_id: str, body: StatusBody) -> AlertOut:
+    def set_status(alert_id: str, body: StatusBody) -> AlertView:
         return _apply_status(alert_id, body.status)
 
     @app.post("/api/alerts/{alert_id}/ack", response_model=AlertOut)
-    def acknowledge(alert_id: str) -> AlertOut:
+    def acknowledge(alert_id: str) -> AlertView:
         return _apply_status(alert_id, "acknowledged")
 
     @app.post("/api/alerts/{alert_id}/resolve", response_model=AlertOut)
-    def resolve(alert_id: str) -> AlertOut:
+    def resolve(alert_id: str) -> AlertView:
         return _apply_status(alert_id, "resolved")
 
     @app.post("/api/alerts/{alert_id}/reopen", response_model=AlertOut)
-    def reopen(alert_id: str) -> AlertOut:
+    def reopen(alert_id: str) -> AlertView:
         return _apply_status(alert_id, "open")
 
     @app.get("/api/services", response_model=list[str])
@@ -613,7 +546,7 @@ def create_app() -> FastAPI:
         pg = cache.recent_dispatches_page(page=page, page_size=page_size)
         meta = _page_meta(pg.page, pg.page_size, pg.total)
         return DispatchPageOut(
-            items=[_dispatch_out(d) for d in pg.items],
+            items=list(pg.items),
             page=meta.page,
             page_size=meta.page_size,
             total=meta.total,
@@ -772,7 +705,7 @@ def create_app() -> FastAPI:
                 existing_id = row.id
                 existing_first = row.first_seen
 
-        created_alert: AlertOut | None = None
+        created_alert: AlertView | None = None
         alert_id: str | None = existing_id
         for i in range(body.count):
             ts = datetime.now(timezone.utc)
@@ -812,9 +745,7 @@ def create_app() -> FastAPI:
 
         _touch_cache()
         if alert_id:
-            cached = cache.get_alert(alert_id)
-            if cached:
-                created_alert = _alert_out(cached)
+            created_alert = cache.get_alert(alert_id)
 
         kafka_note = ""
         if body.also_publish_kafka:

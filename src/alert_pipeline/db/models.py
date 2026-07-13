@@ -17,7 +17,11 @@ class Base(DeclarativeBase):
 
 
 class AlertRecord(Base):
-    """One row per deduplicated incident (open incidents keyed by fingerprint in app logic)."""
+    """One row per deduplicated incident (open incidents keyed by fingerprint in app logic).
+
+    Convert to/from domain models only via ``alert_pipeline.db.mapping``:
+    ``alert_record_from_event`` / ``alert_view_from_record``.
+    """
 
     __tablename__ = "alerts"
 
