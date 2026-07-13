@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from alert_pipeline.alert_config import AlertYamlConfig, get_alert_config, reload_alert_config
 from alert_pipeline.config import Settings, get_settings
@@ -25,12 +25,13 @@ from alert_pipeline.dispatchers.registry import (
 )
 from alert_pipeline.observability import ALERTS_EMITTED, ALERTS_SKIPPED, OUTBOX_ENQUEUED
 from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, LogEvent, LogLevel
+from alert_pipeline.types import JsonObject, JsonValue, ProcessResultDict
 from alert_pipeline.ui_cache_invalidate import invalidate_ui_snapshot
 
 logger = logging.getLogger(__name__)
 
 
-def parse_log_payload(value: Any) -> dict[str, Any] | None:
+def parse_log_payload(value: object) -> JsonObject | None:
     """Normalize heterogeneous Kafka message values to a dict.
 
     Returns None for unparseable payloads (callers may route to DLQ).
@@ -38,19 +39,27 @@ def parse_log_payload(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if isinstance(value, dict):
-        return value
+        return cast(JsonObject, value)
     if isinstance(value, (bytes, bytearray)):
         try:
-            return json.loads(value.decode("utf-8"))
+            parsed: object = json.loads(value.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             logger.warning("Skipping non-JSON bytes payload")
             return None
+        if isinstance(parsed, dict):
+            return cast(JsonObject, parsed)
+        logger.warning("Skipping non-object JSON bytes payload")
+        return None
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError:
             logger.warning("Skipping non-JSON string payload")
             return None
+        if isinstance(parsed, dict):
+            return cast(JsonObject, parsed)
+        logger.warning("Skipping non-object JSON string payload")
+        return None
     logger.warning("Unsupported payload type: %s", type(value))
     return None
 
@@ -68,9 +77,9 @@ class ProcessResult:
     severity: str | None = None
     dispatch_suppressed: bool = False
     skipped_reason: str | None = None
-    raw_for_dlq: Any = None
+    raw_for_dlq: JsonValue = None
 
-    def to_dict(self) -> dict[str, Any] | None:
+    def to_dict(self) -> ProcessResultDict | None:
         if not self.emitted:
             return None
         return {
@@ -141,16 +150,21 @@ class AlertProcessor:
             self.alert_config.defaults.min_level,
         )
 
-    def handle_payload(self, payload: Any) -> ProcessResult:
+    def handle_payload(self, payload: object) -> ProcessResult:
         if isinstance(payload, dict) and payload.get("__unparseable__") is True:
+            raw = payload.get("raw", payload)
             return ProcessResult(
                 emitted=False,
                 skipped_reason="unparseable",
-                raw_for_dlq=payload.get("raw", payload),
+                raw_for_dlq=cast(JsonValue, raw),
             )
         raw = parse_log_payload(payload)
         if raw is None:
-            return ProcessResult(emitted=False, skipped_reason="unparseable", raw_for_dlq=payload)
+            return ProcessResult(
+                emitted=False,
+                skipped_reason="unparseable",
+                raw_for_dlq=cast(JsonValue, payload if _is_json_value(payload) else repr(payload)),
+            )
         return self.handle_event(LogEvent.from_kafka_value(raw))
 
     def handle_event(self, event: LogEvent) -> ProcessResult:
@@ -215,9 +229,10 @@ class AlertProcessor:
         channels = enabled_channel_names(self.settings) if dispatch_enabled else []
         outbox_mode = mode == "outbox" and bool(channels)
 
-        def _should_enqueue(record, al) -> bool:
+        def _should_enqueue(record: object, al: AlertEvent) -> bool:
             # Suppress refire notifications while operator has acked the incident.
-            if not al.is_new and suppress_while_acked and record.status == "acknowledged":
+            status = getattr(record, "status", None)
+            if not al.is_new and suppress_while_acked and status == "acknowledged":
                 return False
             return True
 
@@ -271,3 +286,13 @@ class AlertProcessor:
             severity=alert.severity.value,
             dispatch_suppressed=dispatch_suppressed,
         )
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(x) for x in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_value(v) for k, v in value.items())
+    return False

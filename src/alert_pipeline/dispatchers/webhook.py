@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from alert_pipeline.dispatchers.base import AlertDispatcher, DispatchResult
 from alert_pipeline.schemas import AlertEvent
+from alert_pipeline.types import JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class WebhookDispatcher(AlertDispatcher):
         wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
         reraise=True,
     )
-    def _post(self, body: dict[str, Any]) -> httpx.Response:
+    def _post(self, body: JsonObject) -> httpx.Response:
         with httpx.Client(timeout=15.0) as client:
             return client.post(self.url, json=body, headers=self.headers)
 

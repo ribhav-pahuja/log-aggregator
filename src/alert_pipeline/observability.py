@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,7 @@ if _PROM:
 else:  # pragma: no cover
 
     class _Noop:
-        def labels(self, *args: Any, **kwargs: Any) -> "_Noop":
+        def labels(self, *args: object, **kwargs: object) -> "_Noop":
             return self
 
         def inc(self, amount: float = 1) -> None:

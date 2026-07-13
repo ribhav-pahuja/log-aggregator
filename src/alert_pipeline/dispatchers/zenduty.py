@@ -13,6 +13,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from alert_pipeline.dispatchers.base import AlertDispatcher, DispatchResult
 from alert_pipeline.schemas import AlertEvent, AlertStatus
+from alert_pipeline.types import JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class ZendutyDispatcher(AlertDispatcher):
         self.integration_key = integration_key
         self.api_url = api_url.rstrip("/")
 
-    def _payload(self, alert: AlertEvent) -> dict:
+    def _payload(self, alert: AlertEvent) -> JsonObject:
         event_type = "resolve" if alert.status == AlertStatus.RESOLVED else "trigger"
         severity = alert.severity.value.lower()
         if severity in ("warn", "warning"):
@@ -62,7 +63,7 @@ class ZendutyDispatcher(AlertDispatcher):
         wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
         reraise=True,
     )
-    def _post(self, body: dict) -> httpx.Response:
+    def _post(self, body: JsonObject) -> httpx.Response:
         url = f"{self.api_url}/{self.integration_key}/"
         with httpx.Client(timeout=15.0) as client:
             return client.post(url, json=body)

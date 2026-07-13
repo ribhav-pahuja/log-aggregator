@@ -9,18 +9,30 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Literal, cast
 
 from alert_pipeline.config import Settings
 from alert_pipeline.dedup.quix_state import (
+    StateLike,
     alert_from_wire,
     build_enrichment,
     process_enriched_with_state,
 )
 from alert_pipeline.processing.handler import AlertProcessor, parse_log_payload
 from alert_pipeline.schemas import LEVEL_RANK, LogEvent
+from alert_pipeline.types import (
+    DedupEmitRow,
+    EnrichmentRow,
+    JsonObject,
+    JsonValue,
+    ProcessResultDict,
+)
 
 logger = logging.getLogger(__name__)
+
+DlqProducerKind = Literal["confluent", "kafka-python"]
+DlqProducerBundle = tuple[DlqProducerKind, object]
 
 
 class _SafeJsonDeserializer:
@@ -30,7 +42,7 @@ class _SafeJsonDeserializer:
     def split_values(self) -> bool:
         return False
 
-    def __call__(self, value: bytes, ctx: Any = None) -> Mapping:
+    def __call__(self, value: bytes | bytearray | str | None, ctx: object = None) -> JsonObject:
         if value is None:
             return {"__unparseable__": True, "raw": None}
         try:
@@ -38,10 +50,10 @@ class _SafeJsonDeserializer:
                 text = value.decode("utf-8")
             else:
                 text = str(value)
-            parsed = json.loads(text)
+            parsed: object = json.loads(text)
             if isinstance(parsed, dict):
-                return parsed
-            return {"__unparseable__": True, "raw": parsed}
+                return cast(JsonObject, parsed)
+            return {"__unparseable__": True, "raw": cast(JsonValue, parsed)}
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             try:
                 raw_repr = (
@@ -62,7 +74,9 @@ try:
         def split_values(self) -> bool:
             return False
 
-        def __call__(self, value: bytes, ctx: Any = None) -> Mapping:
+        def __call__(
+            self, value: bytes | bytearray | str | None, ctx: object = None
+        ) -> Mapping[str, JsonValue]:
             return _SafeJsonDeserializer()(value, ctx)
 
 except ImportError:  # pragma: no cover
@@ -100,7 +114,7 @@ class QuixStreamRuntime:
         )
         sdf = app.dataframe(topic=logs)
 
-        def enrich(payload: Any) -> dict[str, Any] | None:
+        def enrich(payload: object) -> EnrichmentRow | None:
             """Parse + min-level gate; attach fingerprint for group_by."""
             if isinstance(payload, dict) and payload.get("__unparseable__") is True:
                 _publish_dlq(
@@ -135,11 +149,14 @@ class QuixStreamRuntime:
                 dedup_fields=list(cfg.dedup_fields),
             )
 
-        def dedup_stateful(row: dict[str, Any], state: Any) -> dict[str, Any] | None:
+        def dedup_stateful(row: EnrichmentRow | JsonObject, state: StateLike) -> DedupEmitRow | None:
             return process_enriched_with_state(row, state)
 
-        def sink(row: dict[str, Any]) -> dict[str, Any] | None:
-            alert = alert_from_wire(row["alert"])
+        def sink(row: DedupEmitRow | JsonObject) -> ProcessResultDict | None:
+            alert_raw = row["alert"]
+            if not isinstance(alert_raw, dict):
+                return None
+            alert = alert_from_wire(cast(JsonObject, alert_raw))
             result = processor.emit_alert(
                 alert,
                 suppress_while_acked=bool(row.get("suppress_dispatch_while_acknowledged", True)),
@@ -168,13 +185,13 @@ class QuixStreamRuntime:
         finally:
             if dlq_producer is not None:
                 try:
-                    dlq_producer.flush(5)
-                    dlq_producer.close()
+                    dlq_producer[1].flush(5)  # type: ignore[union-attr]
+                    dlq_producer[1].close()  # type: ignore[union-attr]
                 except Exception:  # noqa: BLE001
                     pass
 
 
-def _maybe_dlq_producer(settings: Settings):  # noqa: ANN202
+def _maybe_dlq_producer(settings: Settings) -> DlqProducerBundle | None:
     if not settings.kafka_dlq_enabled or not settings.kafka_dlq_topic:
         return None
     try:
@@ -196,29 +213,35 @@ def _maybe_dlq_producer(settings: Settings):  # noqa: ANN202
     return ("confluent", Producer({"bootstrap.servers": settings.kafka_bootstrap_servers}))
 
 
-def _publish_dlq(producer_bundle: Any, topic: str, *, reason: str, payload: Any) -> None:
+def _publish_dlq(
+    producer_bundle: DlqProducerBundle | None,
+    topic: str,
+    *,
+    reason: str,
+    payload: object,
+) -> None:
     if not topic:
         return
-    body = {"reason": reason, "payload": _safe_dlq_payload(payload)}
+    body: JsonObject = {"reason": reason, "payload": _safe_dlq_payload(payload)}
     logger.warning("Routing message to DLQ topic=%s reason=%s", topic, reason)
     if producer_bundle is None:
         return
     kind, producer = producer_bundle
     try:
         if kind == "confluent":
-            producer.produce(topic, json.dumps(body).encode("utf-8"))
-            producer.poll(0)
+            producer.produce(topic, json.dumps(body).encode("utf-8"))  # type: ignore[union-attr]
+            producer.poll(0)  # type: ignore[union-attr]
         else:
-            producer.send(topic, body)
+            producer.send(topic, body)  # type: ignore[union-attr]
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to publish to DLQ: %s", exc)
 
 
-def _safe_dlq_payload(raw: Any) -> Any:
+def _safe_dlq_payload(raw: object) -> JsonValue:
     if isinstance(raw, dict) and raw.get("__unparseable__"):
-        return raw.get("raw")
+        return _safe_dlq_payload(raw.get("raw"))
     if isinstance(raw, (dict, list, str, int, float, bool)) or raw is None:
-        return raw
+        return cast(JsonValue, raw)
     if isinstance(raw, (bytes, bytearray)):
         return raw.decode("utf-8", errors="replace")
     return repr(raw)[:2000]

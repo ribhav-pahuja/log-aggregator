@@ -11,10 +11,11 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from alert_pipeline.schemas import LEVEL_RANK, AlertEvent, AlertStatus, LogEvent, LogLevel
+from alert_pipeline.types import IncidentStateDict, JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,32 @@ MAX_FUTURE_SKEW_SECONDS = 300.0
 DedupAction = Literal["new", "update", "suppress"]
 
 
+class IncidentStateLike(Protocol):
+    """Structural type for ``IncidentState`` (avoids circular imports)."""
+
+    alert_id: str
+    fingerprint: str
+    first_seen: datetime
+    last_seen: datetime
+    occurrence_count: int
+    last_emitted_at: float
+    severity: LogLevel | str
+    service: str
+    host: str
+    title: str
+    sample_message: str
+    error_code: str | None
+    trace_id: str | None
+    labels: dict[str, str]
+    window_seconds: int
+
+
 @dataclass(frozen=True)
 class TransitionResult:
     """Outcome of applying one log event against optional existing incident state."""
 
     action: DedupAction
-    state: dict[str, Any]
+    state: IncidentStateDict
     """Canonical state blob to persist (dict form shared by Quix + memory)."""
 
 
@@ -78,7 +99,7 @@ def _coerce_level(sev: object) -> LogLevel:
 
 
 def window_expired(
-    existing: dict[str, Any],
+    existing: IncidentStateDict,
     *,
     event_ts: float,
     window_seconds: int,
@@ -97,7 +118,7 @@ def window_expired(
 
 def apply_dedup_transition(
     *,
-    existing: dict[str, Any] | None,
+    existing: IncidentStateDict | None,
     event: LogEvent,
     fingerprint: str,
     window_seconds: int,
@@ -127,7 +148,7 @@ def apply_dedup_transition(
 
     if active is None:
         new_id = alert_id or str(uuid4())
-        st: dict[str, Any] = {
+        st: IncidentStateDict = {
             "alert_id": new_id,
             "fingerprint": fingerprint,
             "first_seen": dt_to_iso(event.timestamp),
@@ -148,7 +169,7 @@ def apply_dedup_transition(
         }
         return TransitionResult(action="new", state=st)
 
-    st = dict(active)
+    st = cast(IncidentStateDict, dict(active))
     st["occurrence_count"] = int(st.get("occurrence_count") or 1) + 1
     st["last_seen"] = dt_to_iso(event.timestamp)
     st["sample_message"] = event.message
@@ -170,14 +191,14 @@ def apply_dedup_transition(
 
 
 def alert_event_from_state(
-    st: dict[str, Any],
+    st: IncidentStateDict,
     *,
     is_new: bool,
     description: str,
 ) -> AlertEvent:
     """Build an AlertEvent from a canonical state blob."""
-    first = st["first_seen"]
-    last = st["last_seen"]
+    first: datetime | str = st["first_seen"]
+    last: datetime | str = st["last_seen"]
     if not isinstance(first, datetime):
         first = iso_to_dt(str(first))
     if not isinstance(last, datetime):
@@ -203,18 +224,19 @@ def alert_event_from_state(
 
 
 def alert_wire_from_state(
-    st: dict[str, Any],
+    st: IncidentStateDict,
     *,
     is_new: bool,
     description: str,
-) -> dict[str, Any]:
+) -> JsonObject:
     """JSON-friendly alert dict for the Quix sink path."""
-    return alert_event_from_state(st, is_new=is_new, description=description).model_dump(
-        mode="json"
+    return cast(
+        JsonObject,
+        alert_event_from_state(st, is_new=is_new, description=description).model_dump(mode="json"),
     )
 
 
-def incident_state_to_dict(state: Any) -> dict[str, Any]:
+def incident_state_to_dict(state: IncidentStateLike) -> IncidentStateDict:
     """Convert ``IncidentState`` (or compatible) to the canonical dict blob."""
     sev = state.severity
     sev_s = sev.value if isinstance(sev, LogLevel) else str(sev)
@@ -239,10 +261,10 @@ def incident_state_to_dict(state: Any) -> dict[str, Any]:
     }
 
 
-def dict_to_incident_fields(st: dict[str, Any]) -> dict[str, Any]:
+def dict_to_incident_fields(st: IncidentStateDict) -> dict[str, object]:
     """Keyword args suitable for constructing ``IncidentState``."""
-    first = st["first_seen"]
-    last = st["last_seen"]
+    first: datetime | str = st["first_seen"]
+    last: datetime | str = st["last_seen"]
     if not isinstance(first, datetime):
         first = iso_to_dt(str(first))
     if not isinstance(last, datetime):

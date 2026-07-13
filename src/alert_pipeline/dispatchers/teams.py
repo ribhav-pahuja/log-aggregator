@@ -9,6 +9,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from alert_pipeline.dispatchers.base import AlertDispatcher, DispatchResult
 from alert_pipeline.schemas import AlertEvent
+from alert_pipeline.types import JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class TeamsDispatcher(AlertDispatcher):
             raise ValueError("teams_webhook_url is required when Teams is enabled")
         self.webhook_url = webhook_url
 
-    def _payload(self, alert: AlertEvent) -> dict:
+    def _payload(self, alert: AlertEvent) -> JsonObject:
         color = _THEME.get(alert.severity.value, "E81123")
         status_label = "NEW" if alert.is_new else alert.status.value.upper()
         return {
@@ -61,7 +62,7 @@ class TeamsDispatcher(AlertDispatcher):
         wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
         reraise=True,
     )
-    def _post(self, body: dict) -> httpx.Response:
+    def _post(self, body: JsonObject) -> httpx.Response:
         with httpx.Client(timeout=15.0) as client:
             return client.post(self.webhook_url, json=body)
 

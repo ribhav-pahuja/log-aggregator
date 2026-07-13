@@ -18,12 +18,13 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Generic, TypeVar, cast
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_pipeline.db.models import AlertRecord, DispatchLog
+from alert_pipeline.types import CacheMeta, JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ class CachedAlert:
     dispatch_success: int = 0
     dispatch_failed: int = 0
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "id": self.id,
             "fingerprint": self.fingerprint,
@@ -98,43 +99,63 @@ class CachedAlert:
             "dispatch_failed": self.dispatch_failed,
         }
 
-    def to_jsonable(self) -> dict[str, Any]:
+    def to_jsonable(self) -> JsonObject:
         d = self.as_dict()
-        for k in (
-            "first_seen",
-            "last_seen",
-            "acknowledged_at",
-            "resolved_at",
-            "created_at",
-            "updated_at",
-        ):
-            d[k] = _dt_to_iso(d[k])
-        return d
+        out: JsonObject = {}
+        for k, v in d.items():
+            if k in (
+                "first_seen",
+                "last_seen",
+                "acknowledged_at",
+                "resolved_at",
+                "created_at",
+                "updated_at",
+            ):
+                out[k] = _dt_to_iso(v if isinstance(v, datetime) else None)
+            elif isinstance(v, (str, int, float, bool)) or v is None:
+                out[k] = v
+            elif isinstance(v, dict):
+                out[k] = {str(dk): str(dv) for dk, dv in v.items()}
+            else:
+                out[k] = str(v)
+        return out
 
     @classmethod
-    def from_jsonable(cls, d: dict[str, Any]) -> "CachedAlert":
+    def from_jsonable(cls, d: JsonObject) -> "CachedAlert":
+        labels_raw = d.get("labels") or {}
+        labels = (
+            {str(k): str(v) for k, v in labels_raw.items()}
+            if isinstance(labels_raw, dict)
+            else {}
+        )
+        tta = d.get("tta_seconds")
+        ttr = d.get("ttr_seconds")
         return cls(
-            id=d["id"],
-            fingerprint=d["fingerprint"],
-            title=d["title"],
-            description=d.get("description") or "",
-            severity=d["severity"],
-            service=d["service"],
-            host=d.get("host") or "unknown",
-            status=d["status"],
+            id=str(d["id"]),
+            fingerprint=str(d["fingerprint"]),
+            title=str(d["title"]),
+            description=str(d.get("description") or ""),
+            severity=str(d["severity"]),
+            service=str(d["service"]),
+            host=str(d.get("host") or "unknown"),
+            status=str(d["status"]),
             occurrence_count=int(d.get("occurrence_count") or 1),
-            first_seen=_iso_to_dt(d.get("first_seen")) or datetime.now(timezone.utc),
-            last_seen=_iso_to_dt(d.get("last_seen")) or datetime.now(timezone.utc),
-            error_code=d.get("error_code"),
-            trace_id=d.get("trace_id"),
-            labels=dict(d.get("labels") or {}),
-            sample_message=d.get("sample_message") or "",
-            acknowledged_at=_iso_to_dt(d.get("acknowledged_at")),
-            resolved_at=_iso_to_dt(d.get("resolved_at")),
-            tta_seconds=d.get("tta_seconds"),
-            ttr_seconds=d.get("ttr_seconds"),
-            created_at=_iso_to_dt(d.get("created_at")),
-            updated_at=_iso_to_dt(d.get("updated_at")),
+            first_seen=_iso_to_dt(str(d["first_seen"]) if d.get("first_seen") else None)
+            or datetime.now(timezone.utc),
+            last_seen=_iso_to_dt(str(d["last_seen"]) if d.get("last_seen") else None)
+            or datetime.now(timezone.utc),
+            error_code=None if d.get("error_code") is None else str(d.get("error_code")),
+            trace_id=None if d.get("trace_id") is None else str(d.get("trace_id")),
+            labels=labels,
+            sample_message=str(d.get("sample_message") or ""),
+            acknowledged_at=_iso_to_dt(
+                str(d["acknowledged_at"]) if d.get("acknowledged_at") else None
+            ),
+            resolved_at=_iso_to_dt(str(d["resolved_at"]) if d.get("resolved_at") else None),
+            tta_seconds=int(tta) if isinstance(tta, (int, float)) else None,
+            ttr_seconds=int(ttr) if isinstance(ttr, (int, float)) else None,
+            created_at=_iso_to_dt(str(d["created_at"]) if d.get("created_at") else None),
+            updated_at=_iso_to_dt(str(d["updated_at"]) if d.get("updated_at") else None),
             dispatch_success=int(d.get("dispatch_success") or 0),
             dispatch_failed=int(d.get("dispatch_failed") or 0),
         )
@@ -150,7 +171,7 @@ class CachedDispatch:
     error_message: str | None
     created_at: datetime
 
-    def to_jsonable(self) -> dict[str, Any]:
+    def to_jsonable(self) -> JsonObject:
         return {
             "id": self.id,
             "alert_id": self.alert_id,
@@ -162,15 +183,18 @@ class CachedDispatch:
         }
 
     @classmethod
-    def from_jsonable(cls, d: dict[str, Any]) -> "CachedDispatch":
+    def from_jsonable(cls, d: JsonObject) -> "CachedDispatch":
+        status_code = d.get("status_code")
+        err = d.get("error_message")
         return cls(
-            id=int(d["id"]),
-            alert_id=d["alert_id"],
-            channel=d["channel"],
+            id=int(d["id"]),  # type: ignore[arg-type]
+            alert_id=str(d["alert_id"]),
+            channel=str(d["channel"]),
             success=bool(d["success"]),
-            status_code=d.get("status_code"),
-            error_message=d.get("error_message"),
-            created_at=_iso_to_dt(d.get("created_at")) or datetime.now(timezone.utc),
+            status_code=int(status_code) if isinstance(status_code, (int, float)) else None,
+            error_message=None if err is None else str(err),
+            created_at=_iso_to_dt(str(d["created_at"]) if d.get("created_at") else None)
+            or datetime.now(timezone.utc),
         )
 
 
@@ -187,13 +211,14 @@ class CachedStats:
     dispatches_fail: int = 0
     last_alert_at: datetime | None = None
 
-    def to_jsonable(self) -> dict[str, Any]:
+    def to_jsonable(self) -> JsonObject:
         d = asdict(self)
         d["last_alert_at"] = _dt_to_iso(self.last_alert_at)
-        return d
+        return cast(JsonObject, d)
 
     @classmethod
-    def from_jsonable(cls, d: dict[str, Any]) -> "CachedStats":
+    def from_jsonable(cls, d: JsonObject) -> "CachedStats":
+        last = d.get("last_alert_at")
         return cls(
             total=int(d.get("total") or 0),
             open=int(d.get("open") or 0),
@@ -204,15 +229,18 @@ class CachedStats:
             services=int(d.get("services") or 0),
             dispatches_ok=int(d.get("dispatches_ok") or 0),
             dispatches_fail=int(d.get("dispatches_fail") or 0),
-            last_alert_at=_iso_to_dt(d.get("last_alert_at")),
+            last_alert_at=_iso_to_dt(str(last) if last else None),
         )
 
 
+T = TypeVar("T")
+
+
 @dataclass
-class Page:
+class Page(Generic[T]):
     """Paginated list result."""
 
-    items: list[Any]
+    items: list[T]
     total: int
     page: int
     page_size: int
@@ -243,12 +271,12 @@ class _Snapshot:
     expires_at_unix: float = 0.0
     generation: int = 0
 
-    def to_jsonable(self) -> dict[str, Any]:
+    def to_jsonable(self) -> JsonObject:
         return {
             "alerts": {k: v.to_jsonable() for k, v in self.alerts.items()},
             "dispatches": {k: [d.to_jsonable() for d in v] for k, v in self.dispatches.items()},
             "recent_dispatches": [d.to_jsonable() for d in self.recent_dispatches],
-            "services": self.services,
+            "services": list(self.services),
             "stats": self.stats.to_jsonable(),
             "loaded_at_unix": self.loaded_at_unix,
             "expires_at_unix": self.expires_at_unix,
@@ -256,19 +284,49 @@ class _Snapshot:
         }
 
     @classmethod
-    def from_jsonable(cls, data: dict[str, Any]) -> "_Snapshot":
-        alerts = {k: CachedAlert.from_jsonable(v) for k, v in (data.get("alerts") or {}).items()}
-        dispatches = {
-            k: [CachedDispatch.from_jsonable(x) for x in v]
-            for k, v in (data.get("dispatches") or {}).items()
-        }
-        recent = [CachedDispatch.from_jsonable(x) for x in (data.get("recent_dispatches") or [])]
+    def from_jsonable(cls, data: JsonObject) -> "_Snapshot":
+        alerts_raw = data.get("alerts") or {}
+        dispatches_raw = data.get("dispatches") or {}
+        recent_raw = data.get("recent_dispatches") or []
+        services_raw = data.get("services") or []
+        stats_raw = data.get("stats") or {}
+
+        alerts: dict[str, CachedAlert] = {}
+        if isinstance(alerts_raw, dict):
+            for k, v in alerts_raw.items():
+                if isinstance(v, dict):
+                    alerts[str(k)] = CachedAlert.from_jsonable(cast(JsonObject, v))
+
+        dispatches: dict[str, list[CachedDispatch]] = {}
+        if isinstance(dispatches_raw, dict):
+            for k, v in dispatches_raw.items():
+                if isinstance(v, list):
+                    dispatches[str(k)] = [
+                        CachedDispatch.from_jsonable(cast(JsonObject, x))
+                        for x in v
+                        if isinstance(x, dict)
+                    ]
+
+        recent: list[CachedDispatch] = []
+        if isinstance(recent_raw, list):
+            recent = [
+                CachedDispatch.from_jsonable(cast(JsonObject, x))
+                for x in recent_raw
+                if isinstance(x, dict)
+            ]
+
+        services = [str(s) for s in services_raw] if isinstance(services_raw, list) else []
+        stats = (
+            CachedStats.from_jsonable(cast(JsonObject, stats_raw))
+            if isinstance(stats_raw, dict)
+            else CachedStats()
+        )
         return cls(
             alerts=alerts,
             dispatches=dispatches,
             recent_dispatches=recent,
-            services=list(data.get("services") or []),
-            stats=CachedStats.from_jsonable(data.get("stats") or {}),
+            services=services,
+            stats=stats,
             loaded_at_unix=float(data.get("loaded_at_unix") or 0),
             expires_at_unix=float(data.get("expires_at_unix") or 0),
             generation=int(data.get("generation") or 0),
@@ -402,7 +460,10 @@ class AlertReadCache:
         if not raw:
             return None
         try:
-            return _Snapshot.from_jsonable(json.loads(raw))
+            parsed: object = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            return _Snapshot.from_jsonable(cast(JsonObject, parsed))
         except (json.JSONDecodeError, TypeError, KeyError):
             logger.warning("Corrupt cache snapshot; ignoring")
             return None
@@ -781,7 +842,7 @@ class AlertReadCache:
         labels: list[dict[str, str]] | None = None,
         page: int = 1,
         page_size: int = 10,
-    ) -> Page:
+    ) -> Page[CachedAlert]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         items = self._filtered_alerts(
@@ -798,7 +859,9 @@ class AlertReadCache:
         slice_ = items[start : start + page_size]
         return Page(items=slice_, total=total, page=page, page_size=page_size)
 
-    def alert_dispatches_page(self, alert_id: str, *, page: int = 1, page_size: int = 50) -> Page:
+    def alert_dispatches_page(
+        self, alert_id: str, *, page: int = 1, page_size: int = 50
+    ) -> Page[CachedDispatch]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         snap = self._ensure_fresh()
@@ -812,7 +875,7 @@ class AlertReadCache:
             page_size=page_size,
         )
 
-    def recent_dispatches_page(self, *, page: int = 1, page_size: int = 30) -> Page:
+    def recent_dispatches_page(self, *, page: int = 1, page_size: int = 30) -> Page[CachedDispatch]:
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         rows = list(self._ensure_fresh().recent_dispatches)
@@ -826,17 +889,37 @@ class AlertReadCache:
         )
 
     # Back-compat helpers used by older call sites
-    def list_alerts(self, **kwargs: Any) -> list[CachedAlert]:
-        page = int(kwargs.pop("page", 1) or 1)
+    def list_alerts(
+        self,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+        service: str | None = None,
+        q: str | None = None,
+        label_key: str | None = None,
+        label_value: str | None = None,
+        labels: list[dict[str, str]] | None = None,
+        page: int = 1,
+        page_size: int = 10,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[CachedAlert]:
         # legacy limit/offset
-        if "limit" in kwargs or "offset" in kwargs:
-            limit = int(kwargs.pop("limit", 100))
-            offset = int(kwargs.pop("offset", 0))
-            page_size = limit
-            page = (offset // page_size) + 1 if page_size else 1
-            kwargs["page"] = page
-            kwargs["page_size"] = page_size
-        return self.list_alerts_page(**kwargs).items
+        if limit is not None or offset is not None:
+            page_size = int(limit if limit is not None else page_size)
+            off = int(offset or 0)
+            page = (off // page_size) + 1 if page_size else 1
+        return self.list_alerts_page(
+            status=status,
+            severity=severity,
+            service=service,
+            q=q,
+            label_key=label_key,
+            label_value=label_value,
+            labels=labels,
+            page=page,
+            page_size=page_size,
+        ).items
 
     def alert_dispatches(self, alert_id: str, limit: int = 50) -> list[CachedDispatch]:
         return self.alert_dispatches_page(alert_id, page=1, page_size=limit).items
@@ -844,7 +927,7 @@ class AlertReadCache:
     def recent_dispatches(self, limit: int = 30) -> list[CachedDispatch]:
         return self.recent_dispatches_page(page=1, page_size=limit).items
 
-    def meta(self) -> dict[str, Any]:
+    def meta(self) -> CacheMeta:
         snap = self._read_redis_snapshot()
         with self._local_lock:
             local_gen = self._local.generation
@@ -854,8 +937,8 @@ class AlertReadCache:
         return {
             "source": self._backend,
             "snapshot_key": self._snapshot_key,
-            "ttl_seconds": self.ttl_seconds,
-            "lock_ttl_seconds": self.lock_ttl_seconds,
+            "ttl_seconds": float(self.ttl_seconds),
+            "lock_ttl_seconds": float(self.lock_ttl_seconds),
             "stampede_protection": "redis_nx_lock+probabilistic_early_expire",
             "redis_generation": snap.generation if snap else None,
             "redis_expires_at_unix": snap.expires_at_unix if snap else None,
