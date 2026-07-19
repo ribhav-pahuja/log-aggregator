@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alert-pipeline"
 version = "0.1.0"
-description = "Kafka-based alert deduplication and multi-destination dispatch pipeline"
+description = "Alert deduplication pipeline: Kafka + Grafana (Loki/Alerting) ingress → Postgres → multi-destination dispatch"
 readme = "README.md"
 requires-python = ">=3.11"
 # Shared core (pipeline + UI). Prefer a lockfile (requirements.lock) for prod images.
@@ -48,6 +48,7 @@ alert-pipeline = "alert_pipeline.main:main"
 alert-dispatch-worker = "alert_pipeline.dispatchers.outbox_worker:main"
 log-producer = "alert_pipeline.sample_producer:main"
 alert-ui = "alert_pipeline.ui.app:main"
+grafana-source = "alert_pipeline.sources.grafana.main:main"
 
 [tool.ruff]
 line-length = 100

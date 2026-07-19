@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     ui_cache_key_prefix: str = "alert_ui"
     ui_cache_invalidate_on_write: bool = True
 
+    # --- Grafana ingress (optional bridge → Kafka logs topic) ---
+    # Run with: grafana-source  (see sources/grafana/)
+    # mode: loki = poll LogQL; webhook = Grafana Alerting contact point; both
+    grafana_source_mode: Literal["loki", "webhook", "both"] = "loki"
+    grafana_loki_url: str = ""  # e.g. http://loki:3100 or Grafana Cloud Loki URL
+    grafana_loki_query: str = '{job=~".+"}'
+    grafana_loki_poll_seconds: float = Field(default=15.0, ge=1.0)
+    grafana_loki_lookback_seconds: int = Field(default=60, ge=1)
+    grafana_loki_limit: int = Field(default=1000, ge=1, le=5000)
+    grafana_loki_username: str = ""
+    grafana_loki_password: str = ""
+    grafana_loki_bearer_token: str = ""
+    grafana_loki_org_id: str = ""  # multi-tenant: X-Scope-OrgID header
+    grafana_webhook_host: str = "0.0.0.0"
+    grafana_webhook_port: int = Field(default=8090, ge=1, le=65535)
+    grafana_webhook_path: str = "/grafana/webhook"
+
     log_level: str = "INFO"
 
     @field_validator("pipeline_runtime", mode="before")

@@ -1,6 +1,6 @@
 # Alert deduplication pipeline
 
-Kafka → **deduplicate** noisy error logs into incidents → **PostgreSQL** (system of record) → **fan-out** to Zenduty, Microsoft Teams, webhooks, and more.
+Kafka **or Grafana (Loki / Alerting)** → **deduplicate** noisy error logs into incidents → **PostgreSQL** (system of record) → **fan-out** to Zenduty, Microsoft Teams, webhooks, and more.
 
 Includes an **operator UI** (ack / resolve, TTA/TTR, demo fire, **shared label widgets**) backed by a **Redis read cache** so multiple UI instances stay consistent.
 
@@ -13,29 +13,29 @@ Repository: [github.com/ribhav-pahuja/log-aggregator](https://github.com/ribhav-
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────┐
-  App logs ───────► │  Kafka: logs  (+ logs-dlq)      │
-                    └───────────────┬─────────────────┘
-                                    │
-              ┌─────────────────────┴─────────────────────┐
-              │  Quix Streams (Dockerfile.pipeline)         │
-              │  1. parse / min-level                       │
-              │  2. group_by(fingerprint)                   │
-              │  3. keyed-state dedup (event-time window)   │
-              │  4. emit → Postgres + outbox enqueue        │
-              └─────────────────────┬─────────────────────┘
-                                    │
-          ┌─────────────────────────┼─────────────────────────┐
-          ▼                         ▼                         ▼
-    PostgreSQL              dispatch worker              Operator UI
-    alerts (+ Alembic)      (outbox → Zenduty/           Dockerfile.ui
-    dispatch_outbox         Teams / webhook)             FastAPI :8000
-    dispatch_log                                           │ /metrics
-    dashboard_widgets                                      ▼
-                                                    Redis: UI snapshot cache only
+  App logs ──► Kafka: logs          Grafana Loki ──┐
+  (shippers)   (+ logs-dlq)         Grafana Alert ─┼──► grafana-source ──► Kafka: logs
+                                    (webhook)      ┘         │
+                                                             ▼
+                    ┌──────────────────────────────────────────────┐
+                    │  Quix Streams (Dockerfile.pipeline)            │
+                    │  1. parse / min-level                          │
+                    │  2. group_by(fingerprint)                      │
+                    │  3. keyed-state dedup (event-time window)      │
+                    │  4. emit → Postgres + outbox enqueue           │
+                    └─────────────────────┬────────────────────────┘
+                                          │
+          ┌───────────────────────────────┼───────────────────────────────┐
+          ▼                               ▼                               ▼
+    PostgreSQL                    dispatch worker                   Operator UI
+    alerts (+ Alembic)            (outbox → Zenduty/                Dockerfile.ui
+    dispatch_outbox               Teams / webhook)                  FastAPI :8000
+    dispatch_log                                                      │ /metrics
+    dashboard_widgets                                                 ▼
+                                                             Redis: UI snapshot cache only
 ```
 
-**Core idea:** **Dedup** runs in **Quix keyed state** (`group_by` + per-fingerprint state, **event-time** windows). `AlertProcessor` **persists** incidents and **enqueues** notifications to `dispatch_outbox`. A separate **`alert-dispatch-worker`** drains the outbox (idempotent per channel). **Redis is only the UI read cache** (not used for dedup).
+**Core idea:** All ingress is normalized onto the Kafka **`logs`** topic (native producers **or** the optional **`grafana-source`** bridge). **Dedup** runs in **Quix keyed state** (`group_by` + per-fingerprint state, **event-time** windows). `AlertProcessor` **persists** incidents and **enqueues** notifications to `dispatch_outbox`. A separate **`alert-dispatch-worker`** drains the outbox (idempotent per channel). **Redis is only the UI read cache** (not used for dedup).
 
 **HLD:** [`docs/HLD.md`](docs/HLD.md)
 
@@ -71,6 +71,7 @@ docker compose --profile demo up -d
 | `alert-ui` | Operator UI + APIs + `/metrics` (`Dockerfile.ui`) | **8000** |
 | `webhook-debug` | Echo sink (opt-in via `DISPATCH_WEBHOOK_ENABLED`) | `8080` |
 | `log-producer` | Demo traffic (`--profile demo`) | — |
+| `grafana-source` | Grafana Loki poll + Alerting webhook → Kafka (`--profile grafana`) | **8090** (webhook) |
 
 
 ### Tear down
@@ -287,6 +288,67 @@ Demo fire **always writes Postgres** (so the UI updates immediately); optional K
 
 ---
 
+## Grafana ingress
+
+Kafka remains the pipeline transport. To also take logs (and alerts) from **Grafana**, run the optional **`grafana-source`** process. It normalizes events to the same JSON shape as Kafka producers and publishes to `KAFKA_INPUT_TOPIC` (`logs`).
+
+| Mode | What it does |
+| --- | --- |
+| `loki` | Polls Grafana **Loki** via LogQL `query_range` |
+| `webhook` | HTTP contact point for **Grafana Alerting** (Alertmanager-compatible JSON) |
+| `both` | Webhook server + Loki poll in one process (Compose default for the profile) |
+
+```bash
+# Host (pipeline deps include Kafka producer via quixstreams)
+pip install -e ".[pipeline]"
+export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+export GRAFANA_LOKI_URL=http://localhost:3100
+export GRAFANA_LOKI_QUERY='{job=~".+"} |~ "(?i)error|exception|panic"'
+export GRAFANA_SOURCE_MODE=both   # or loki | webhook
+grafana-source
+```
+
+Compose profile (webhook on **:8090**):
+
+```bash
+# In .env:
+# GRAFANA_SOURCE_MODE=both
+# GRAFANA_LOKI_URL=http://host.docker.internal:3100   # or your Loki URL
+docker compose --profile grafana up -d grafana-source
+```
+
+**Grafana Alerting contact point:** webhook URL  
+`http://<pipeline-host>:8090/grafana/webhook`  
+(health: `GET /grafana/webhook` or `GET /health`)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GRAFANA_SOURCE_MODE` | `loki` | `loki` \| `webhook` \| `both` |
+| `GRAFANA_LOKI_URL` | _(empty)_ | Loki base URL (required for `loki` / `both`) |
+| `GRAFANA_LOKI_QUERY` | `{job=~".+"}` | LogQL selector |
+| `GRAFANA_LOKI_POLL_SECONDS` | `15` | Poll interval |
+| `GRAFANA_LOKI_LOOKBACK_SECONDS` | `60` | First-poll lookback |
+| `GRAFANA_LOKI_BEARER_TOKEN` / `USERNAME`+`PASSWORD` | — | Auth |
+| `GRAFANA_LOKI_ORG_ID` | — | `X-Scope-OrgID` (multi-tenant) |
+| `GRAFANA_WEBHOOK_PORT` | `8090` | Alerting webhook listen port |
+| `GRAFANA_WEBHOOK_PATH` | `/grafana/webhook` | POST path |
+
+Package layout:
+
+```text
+sources/
+  base.py           # BaseLogSource + LogSink protocol + run_sources()
+  kafka_sink.py     # final adapter → Kafka logs topic
+  grafana/
+    normalize.py    # Loki / Alerting → NormalizedLog
+    loki.py         # LokiSource(BaseLogSource)
+    webhook.py      # GrafanaWebhookSource(BaseLogSource)
+```
+
+**Extension pattern:** implement `BaseLogSource` (normalize + `self.emit(...)` only). Do not talk to Kafka in the source — inject `KafkaLogSink` (or any `LogSink`) as the final adapter.
+
+---
+
 ## Dispatch destinations
 
 Pluggable `AlertDispatcher` implementations:
@@ -313,6 +375,7 @@ See [`.env.example`](.env.example). Important variables:
 | `ALERT_CONFIG_PATH` | `config/alerts.yaml` | Dedup / refire YAML |
 | `DEDUP_WINDOW_SECONDS` | `300` | Fallback if YAML missing |
 | `DISPATCH_*` | — | Channel toggles and secrets |
+| `GRAFANA_*` | — | Optional Grafana Loki / Alerting bridge (see [Grafana ingress](#grafana-ingress)) |
 
 Behavioural tuning prefers **`config/alerts.yaml`** over env when both apply.
 
@@ -324,6 +387,8 @@ Behavioural tuning prefers **`config/alerts.yaml`** over env when both apply.
 src/alert_pipeline/
   runtime/quix_runtime.py # Kafka → group_by → state dedup → emit
   processing/handler.py   # AlertProcessor — persist + dispatch
+  sources/                # optional non-Kafka ingress → Kafka
+    grafana/              # Loki poll + Alerting webhook (grafana-source)
   dedup/
     quix_state.py         # window/refire transitions (Quix State)
     fingerprint.py        # hash + title

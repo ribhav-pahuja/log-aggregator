@@ -232,6 +232,45 @@ services:
     networks:
       - alert-net
 
+  # Optional: Grafana Loki poll + Alerting webhook → Kafka logs topic
+  #   docker compose --profile grafana up -d grafana-source
+  # Point Grafana contact point webhook at http://<host>:8090/grafana/webhook
+  # Set GRAFANA_LOKI_URL to your Loki (or leave empty and use GRAFANA_SOURCE_MODE=webhook)
+  grafana-source:
+    profiles: ["grafana"]
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    image: ${PIPELINE_IMAGE:-alert-pipeline:local}
+    container_name: alert-grafana-source
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_INPUT_TOPIC: ${KAFKA_INPUT_TOPIC:-logs}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      # GRAFANA_* (mode, Loki URL/query, auth) come from .env when set.
+      # Default mode=both: webhook always on; Loki poll needs GRAFANA_LOKI_URL.
+      GRAFANA_SOURCE_MODE: ${GRAFANA_SOURCE_MODE:-both}
+      GRAFANA_WEBHOOK_HOST: "0.0.0.0"
+      GRAFANA_WEBHOOK_PORT: "8090"
+      WAIT_FOR_KAFKA: "1"
+      WAIT_FOR_POSTGRES: "0"
+      RUN_MIGRATIONS: "0"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    command: ["grafana-source"]
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
+    networks:
+      - alert-net
+
   alert-ui:
     build:
       context: .
