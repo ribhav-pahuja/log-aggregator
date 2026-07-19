@@ -213,7 +213,9 @@ def normalize_loki_query_response(payload: dict[str, Any] | JsonObject) -> list[
     for stream_row in result:
         if not isinstance(stream_row, dict):
             continue
-        stream_labels = stream_row.get("stream") if isinstance(stream_row.get("stream"), dict) else {}
+        stream_labels = (
+            stream_row.get("stream") if isinstance(stream_row.get("stream"), dict) else {}
+        )
         values = stream_row.get("values")
         if not isinstance(values, list):
             continue
@@ -341,7 +343,9 @@ def normalize_grafana_alert_webhook(payload: dict[str, Any] | JsonObject) -> lis
             synthetic["labels"] = {"alertname": str(synthetic["alertname"])}
         if "status" not in synthetic:
             state = str(synthetic.get("state") or synthetic.get("status") or "firing")
-            synthetic["status"] = "resolved" if state.lower() in ("ok", "resolved", "normal") else "firing"
+            synthetic["status"] = (
+                "resolved" if state.lower() in ("ok", "resolved", "normal") else "firing"
+            )
         return [
             normalize_grafana_alert(
                 synthetic,

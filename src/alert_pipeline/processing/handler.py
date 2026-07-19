@@ -232,11 +232,7 @@ class AlertProcessor:
         def _should_enqueue(record: object, al: AlertEvent) -> bool:
             # Suppress refire notifications while operator has acked the incident.
             status = getattr(record, "status", None)
-            if (
-                not al.is_new
-                and suppress_while_acked
-                and status == AlertStatus.ACKNOWLEDGED.value
-            ):
+            if not al.is_new and suppress_while_acked and status == AlertStatus.ACKNOWLEDGED.value:
                 return False
             return True
 

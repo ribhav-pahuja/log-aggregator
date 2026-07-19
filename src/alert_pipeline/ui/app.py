@@ -507,7 +507,9 @@ def create_app() -> FastAPI:
             try:
                 st = OutboxStatus.parse(status)
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid outbox status: {status}") from exc
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid outbox status: {status}"
+                ) from exc
         total = repo.count_outbox(st)
         offset = (page - 1) * page_size
         rows = repo.list_outbox(status=st, limit=page_size, offset=offset)

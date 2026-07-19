@@ -149,7 +149,9 @@ class QuixStreamRuntime:
                 dedup_fields=list(cfg.dedup_fields),
             )
 
-        def dedup_stateful(row: EnrichmentRow | JsonObject, state: StateLike) -> DedupEmitRow | None:
+        def dedup_stateful(
+            row: EnrichmentRow | JsonObject, state: StateLike
+        ) -> DedupEmitRow | None:
             return process_enriched_with_state(row, state)
 
         def sink(row: DedupEmitRow | JsonObject) -> ProcessResultDict | None:

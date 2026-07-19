@@ -205,9 +205,7 @@ class AlertRepository:
             row = session.get(AlertRecord, alert_id)
             return row.status if row else None
 
-    def set_alert_status(
-        self, alert_id: str, status: AlertStatus | str
-    ) -> AlertRecord | None:
+    def set_alert_status(self, alert_id: str, status: AlertStatus | str) -> AlertRecord | None:
         """Operator actions: acknowledge / resolve / reopen — also persists TTA/TTR."""
         try:
             parsed = AlertStatus.parse(status)
